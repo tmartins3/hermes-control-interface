@@ -3,7 +3,9 @@
    ============================================ */
 import { Chart, registerables } from 'chart.js';
 import { toDisplayText } from './chat-render-utils.mjs';
+import { shouldRenderChatMessage } from './chat-message-utils.mjs';
 import { resolveSessionDisplayTitle } from './session-title-utils.mjs';
+import { parseSkillBrowseTable, parseSkillTable } from './skill-table-utils.mjs';
 Chart.register(...registerables);
 
 // State
@@ -491,7 +493,9 @@ async function reloadCurrentSessionMessages() {
     // Rebuild messages cleanly
     container.innerHTML = '';
     for (const m of data.messages) {
-      container.appendChild(renderChatMessage(m));
+      if (!shouldRenderChatMessage(m)) continue;
+      const rendered = renderChatMessage(m);
+      if (rendered) container.appendChild(rendered);
     }
     highlightCodeBlocks(container);
     container.scrollTop = container.scrollHeight;
@@ -552,7 +556,9 @@ async function loadChatSession(sessionId) {
 
     container.innerHTML = '';
     for (const m of data.messages) {
-      container.appendChild(renderChatMessage(m));
+      if (!shouldRenderChatMessage(m)) continue;
+      const rendered = renderChatMessage(m);
+      if (rendered) container.appendChild(rendered);
     }
     highlightCodeBlocks(container);
     container.scrollTop = container.scrollHeight;
@@ -562,6 +568,7 @@ async function loadChatSession(sessionId) {
 }
 
 function renderChatMessage(msg) {
+  if (!shouldRenderChatMessage(msg)) return null;
   const role = msg.role || 'unknown';
   const labels = {
     user: { label: 'You', icon: '👤', cls: 'msg-user' },
@@ -2298,6 +2305,15 @@ async function loadAgentGateway(container, name) {
     const ok = res.ok;
     const active = ok && res.active;
 
+    const manager = res.manager || 'systemd';
+    const controlsHtml = manager === 'launchd'
+      ? `<div style="margin-top:12px;font-size:11px;color:var(--fg-muted);line-height:1.5;">Service start/stop controls are disabled on macOS in HCI. Use Hermes CLI/launchctl until launchd service management is implemented.</div>`
+      : `<div class="card-actions" style="margin-top:12px;">
+            <button class="btn btn-ghost" onclick="gatewayAction('${name}', 'start')" ${active ? 'disabled' : ''}>Start</button>
+            <button class="btn btn-ghost" onclick="gatewayAction('${name}', 'stop')" ${!active ? 'disabled' : ''}>Stop</button>
+            <button class="btn btn-ghost" onclick="gatewayAction('${name}', 'restart')">Restart</button>
+          </div>`;
+
     container.innerHTML = `
       <div id="gateway-health" style="margin-bottom:12px;">
         <div class="loading">Checking gateway health...</div>
@@ -2306,13 +2322,10 @@ async function loadAgentGateway(container, name) {
         <div class="card">
           <div class="card-title">Gateway Service</div>
           <div class="stat-row"><span class="stat-label">Service</span><span class="stat-value">${res.service || '—'}</span></div>
+          <div class="stat-row"><span class="stat-label">Manager</span><span class="stat-value">${manager}</span></div>
           <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value ${active ? 'status-ok' : 'status-off'}">${active ? '● Running' : '○ Stopped'}</span></div>
           <div class="stat-row"><span class="stat-label">Enabled</span><span class="stat-value">${res.enabled ? 'Yes' : 'No'}</span></div>
-          <div class="card-actions" style="margin-top:12px;">
-            <button class="btn btn-ghost" onclick="gatewayAction('${name}', 'start')" ${active ? 'disabled' : ''}>Start</button>
-            <button class="btn btn-ghost" onclick="gatewayAction('${name}', 'stop')" ${!active ? 'disabled' : ''}>Stop</button>
-            <button class="btn btn-ghost" onclick="gatewayAction('${name}', 'restart')">Restart</button>
-          </div>
+          ${controlsHtml}
         </div>
         <div class="card">
           <div class="card-title">Connections</div>
@@ -2611,29 +2624,8 @@ function formatRelativeTime(dateStr) {
   return months + 'mo ago';
 }
 
-// Parse hermes skills table output (box-drawing chars) into structured data
-function parseSkillTable(output) {
-  const lines = String(output || '').split('\n');
-  const skills = [];
-  const rowPattern = /[│┃]\s*([^│┃\s][^│┃]*?)\s*[│┃]\s*([^│┃]*?)\s*[│┃]\s*(\S+)\s*[│┃]\s*(\S+)\s*[│┃]\s*([^│┃]*?)\s*[│┃]/;
-  for (const line of lines) {
-    if (line.includes('┏') || line.includes('┗') || line.includes('┡') || line.includes('┩') || line.includes('╍')) continue;
-    const match = line.match(rowPattern);
-    if (match) {
-      const name = match[1].trim();
-      if (!name || name === 'Name' || name === '#') continue;
-      skills.push({
-        name,
-        description: match[2].trim(),
-        source: match[3].trim(),
-        trust: match[4].trim(),
-        identifier: match[5].trim(),
-      });
-    }
-  }
-  return skills;
-}
-
+// Parse hermes skills table output (box-drawing chars) into structured data.
+// Implementation lives in ./skill-table-utils.mjs for regression tests.
 async function loadAgentConfig(container, name) {
   container.innerHTML = `<div class="loading">Loading config for ${name}...</div>`;
 
@@ -3362,20 +3354,7 @@ async function loadSkills(container) {
       }
 
       // Parse table rows
-      const skills = [];
-      const lines = output.split('\n');
-      for (const line of lines) {
-        const match = line.match(/[│|]\s*(\d+)\s*[│|]\s*([^\s│|]+)\s*[│|]\s*(.{10,}?)\s*[│|]\s*(\S+)\s*[│|]\s*(.+?)\s*[│|]/);
-        if (match) {
-          skills.push({
-            num: match[1],
-            name: match[2].trim(),
-            description: match[3].trim().replace(/\.\.\.$/, ''),
-            source: match[4].trim(),
-            trust: match[5].trim(),
-          });
-        }
-      }
+      const skills = parseSkillBrowseTable(output);
 
       // Build HTML
       let html = '<div class="card-grid">';
