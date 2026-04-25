@@ -28,6 +28,7 @@ const {
   parseHermesProfileList,
 } = require('./lib/hermes-profiles');
 const { summarizeGatewayService } = require('./lib/gateway-status');
+const { summarizeTopTools } = require('./lib/usage-utils');
 
 // ── LLM Pricing (via @pydantic/genai-prices) ──
 const { calcPrice } = require('@pydantic/genai-prices');
@@ -3780,20 +3781,21 @@ app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, 
           platformMap[pKey].tokens += tokens;
         }
 
-        // Top tools
+        // Top tools: current Hermes stores most tool calls as JSON in messages.tool_calls;
+        // older rows may still populate messages.tool_name.
         const tools = db.prepare(`
-          SELECT tool_name, COUNT(*) as calls
+          SELECT tool_name, tool_calls
           FROM messages
-          WHERE tool_name IS NOT NULL AND tool_name != ''
-            AND timestamp > strftime('%s', 'now', ? || ' days')
-          GROUP BY tool_name
-          ORDER BY calls DESC
-          LIMIT 10
+          WHERE timestamp > strftime('%s', 'now', ? || ' days')
+            AND (
+              (tool_name IS NOT NULL AND tool_name != '')
+              OR (tool_calls IS NOT NULL AND tool_calls != '')
+            )
         `).all(since);
 
-        for (const t of (tools || [])) {
-          if (!toolMap[t.tool_name]) toolMap[t.tool_name] = { name: t.tool_name, calls: 0 };
-          toolMap[t.tool_name].calls += t.calls;
+        for (const t of summarizeTopTools(tools, 1000)) {
+          if (!toolMap[t.name]) toolMap[t.name] = { name: t.name, calls: 0 };
+          toolMap[t.name].calls += t.calls;
         }
       } finally {
         db.close();
@@ -3999,17 +4001,17 @@ app.get('/api/usage/daily/:days', requireAuth, requirePerm('usage.view'), async 
         ORDER BY hour ASC
       `).all(since);
 
-      // Top tools
-      const topTools = db.prepare(`
-        SELECT tool_name, COUNT(*) as calls
+      // Top tools: current Hermes stores tool calls in messages.tool_calls JSON.
+      const toolRows = db.prepare(`
+        SELECT tool_name, tool_calls
         FROM messages
-        WHERE tool_name IS NOT NULL
-          AND tool_name != ''
-          AND timestamp > strftime('%s', 'now', ? || ' days')
-        GROUP BY tool_name
-        ORDER BY calls DESC
-        LIMIT 10
+        WHERE timestamp > strftime('%s', 'now', ? || ' days')
+          AND (
+            (tool_name IS NOT NULL AND tool_name != '')
+            OR (tool_calls IS NOT NULL AND tool_calls != '')
+          )
       `).all(since);
+      const topTools = summarizeTopTools(toolRows, 10);
 
       // Avg duration
       const avgDur = db.prepare(`

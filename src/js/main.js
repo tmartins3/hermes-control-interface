@@ -5,7 +5,9 @@ import { Chart, registerables } from 'chart.js';
 import { toDisplayText } from './chat-render-utils.mjs';
 import { shouldRenderChatMessage } from './chat-message-utils.mjs';
 import { resolveSessionDisplayTitle } from './session-title-utils.mjs';
+import { routeFromHash } from './route-utils.mjs';
 import { parseSkillBrowseTable, parseSkillTable } from './skill-table-utils.mjs';
+import { renderInstalledSkillsSection, renderSkillCatalogSection } from './skill-page-utils.mjs';
 Chart.register(...registerables);
 
 // State
@@ -90,7 +92,8 @@ function showApp() {
   document.getElementById('login-overlay').classList.add('hidden');
   document.getElementById('app').style.display = 'block';
   updateUserMenu();
-  navigate(state.page);
+  const route = routeFromHash(window.location.hash, state.page || 'home');
+  navigate(route.page, route.params);
   startNotifPolling();
 }
 
@@ -3076,6 +3079,8 @@ async function loadUsage(container) {
   } catch (e) {
     // ignore
   }
+
+  await fetchUsageData();
 }
 
 async function fetchUsageData() {
@@ -3329,11 +3334,16 @@ async function loadSkills(container) {
   let currentPage = 1;
   let totalPages = 1;
   let profiles = [];
+  let installedSkills = [];
 
-  // Load profiles for install picker
+  // Load profiles for install picker and installed skills for the page summary.
   try {
-    const profRes = await api('/api/profiles');
+    const [profRes, skillsRes] = await Promise.all([
+      api('/api/profiles'),
+      api('/api/skills'),
+    ]);
     if (profRes.ok) profiles = profRes.profiles || [];
+    if (skillsRes.ok) installedSkills = skillsRes.skills || [];
   } catch {}
 
   async function loadPage(page) {
@@ -3341,7 +3351,7 @@ async function loadSkills(container) {
     try {
       const res = await api(`/api/skills/browse/${page}`);
       if (!res.ok) {
-        contentEl.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${escapeHtml(res.error || 'Failed to load')}</div></div>`;
+        contentEl.innerHTML = renderInstalledSkillsSection(installedSkills) + `<div class="card"><div class="card-title">Optional Skills Catalog Error</div><div class="error-msg">${escapeHtml(res.error || 'Failed to load')}</div></div>`;
         return;
       }
 
@@ -3356,44 +3366,7 @@ async function loadSkills(container) {
       // Parse table rows
       const skills = parseSkillBrowseTable(output);
 
-      // Build HTML
-      let html = '<div class="card-grid">';
-      if (skills.length === 0) {
-        html += `<div class="card"><div class="card-title">No skills found on page ${page}</div><pre style="font-size:10px;color:var(--fg-muted);max-height:400px;overflow-y:auto;white-space:pre-wrap;">${escapeHtml(output)}</pre></div>`;
-      } else {
-        for (const s of skills) {
-          const isOfficial = s.source === 'official';
-          const badgeColor = isOfficial ? 'var(--accent)' : 'var(--fg-muted)';
-          html += `
-            <div class="card" style="position:relative;">
-              <div class="card-title">${escapeHtml(s.name)}</div>
-              <div style="font-size:12px;color:var(--fg-muted);margin-top:4px;">${escapeHtml(s.description)}</div>
-              <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-                <span class="badge" style="font-size:10px;background:${badgeColor}22;color:${badgeColor};">${escapeHtml(s.source)}</span>
-                ${s.trust ? `<span class="badge" style="font-size:10px;">${escapeHtml(s.trust)}</span>` : ''}
-              </div>
-              <div style="margin-top:10px;display:flex;gap:6px;">
-                <button class="btn btn-ghost btn-sm" onclick="window.inspectSkill('${escapeHtml(s.name)}')">👁️ Preview</button>
-                <button class="btn btn-primary btn-sm" onclick="window.installSkill('${escapeHtml(s.name)}')">⬇️ Install</button>
-              </div>
-            </div>
-          `;
-        }
-      }
-      html += '</div>';
-
-      // Pagination
-      html += '<div style="display:flex;justify-content:center;gap:8px;margin-top:16px;">';
-      if (currentPage > 1) {
-        html += `<button class="btn btn-ghost" onclick="skillsLoadPage(${currentPage - 1})">← Page ${currentPage - 1}</button>`;
-      }
-      html += `<span style="color:var(--fg-muted);padding:8px;">Page ${currentPage} / ${totalPages}</span>`;
-      if (currentPage < totalPages) {
-        html += `<button class="btn btn-ghost" onclick="skillsLoadPage(${currentPage + 1})">Page ${currentPage + 1} →</button>`;
-      }
-      html += '</div>';
-
-      contentEl.innerHTML = html;
+      contentEl.innerHTML = renderInstalledSkillsSection(installedSkills) + renderSkillCatalogSection(skills, { currentPage, totalPages });
     } catch (e) {
       contentEl.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
     }
@@ -4789,10 +4762,8 @@ function init() {
 
   // Hash routing
   window.addEventListener('hashchange', () => {
-    const hash = window.location.hash.slice(1) || 'home';
-    const [page, ...rest] = hash.split('/');
-    const params = rest.length ? { name: rest[0] } : {};
-    navigate(page, params);
+    const route = routeFromHash(window.location.hash);
+    navigate(route.page, route.params);
   });
 
   // Init
