@@ -2,12 +2,14 @@
    HCI Main Entry Point
    ============================================ */
 import { Chart, registerables } from 'chart.js';
+import { initI18n, applyTranslations as i18nApply, t } from '../i18n/index.js';
 import { toDisplayText } from './chat-render-utils.mjs';
 import { shouldRenderChatMessage } from './chat-message-utils.mjs';
 import { resolveSessionDisplayTitle } from './session-title-utils.mjs';
 import { routeFromHash } from './route-utils.mjs';
 import { parseSkillBrowseTable, parseSkillTable } from './skill-table-utils.mjs';
-import { renderInstalledSkillsSection, renderSkillCatalogSection } from './skill-page-utils.mjs';
+import { renderInstalledSkillsSection, renderSkillCatalogSection } from './skill-page-utils.mjs';import { SSE_EVENT_TYPES, mapWsType } from '../../lib/sse-events.js';
+import { wsClient } from './ws-client.js';
 Chart.register(...registerables);
 
 // State
@@ -20,8 +22,17 @@ const state = {
   notifInterval: null,
   notifFailCount: 0,
   _currentChatSession: null,
+  _optMessages: null, // Map<optId, {text, el, ts}>
+  _recentMessages: null, // Ring buffer for dedup {role, content, ts}[]
   chatSidebarOpen: localStorage.getItem('hci-chat-sidebar') !== 'false',
+  _wsConnected: false, // WebSocket connection state
+  _soundEnabled: false, // Sound notification preference
+  _soundReady: false, // Audio element initialized
+  _soundEl: null, // Audio element ref
+  _wsToolCount: 0, // Live count of running tools
+  _artifactCount: 0, // Live count of artifacts created
   auditDisplayLimit: 15,
+  _officeInterval: null,
 };
 
 // ============================================
@@ -85,7 +96,7 @@ function showSetup() {
   document.getElementById('login-form').style.display = 'none';
   document.getElementById('setup-form').style.display = 'flex';
   document.getElementById('app').style.display = 'none';
-  document.getElementById('login-sub').textContent = 'First run — create admin account';
+  document.getElementById('login-sub').textContent = t('login.subtitleFirstRun');
 }
 
 function showApp() {
@@ -95,6 +106,59 @@ function showApp() {
   const route = routeFromHash(window.location.hash, state.page || 'home');
   navigate(route.page, route.params);
   startNotifPolling();
+
+  // ── Phase 3: Session Restore ──
+  // Restore last session from localStorage after sidebar loads
+  const lastSid = localStorage.getItem('hci-last-session');
+  if (lastSid && state.page === 'chat') {
+    // Poll until sessions are loaded in DOM
+    let attempts = 0;
+    const tryRestore = () => {
+      attempts++;
+      const exists = document.querySelector(`.chat-session-item[data-sid="${lastSid}"]`);
+      if (exists) {
+        loadChatSession(lastSid);
+      } else if (attempts < 10) {
+        setTimeout(tryRestore, 400);
+      } else {
+        localStorage.removeItem('hci-last-session');
+      }
+    };
+    setTimeout(tryRestore, 300);
+  }
+
+  // Phase 3: init gateway health badge (defer until DOM renders)
+  if (state.page === 'chat') setTimeout(() => updateGatewayBadge().catch(() => {}), 100);
+  // Connect WebSocket for real-time events — add listeners BEFORE connect to avoid race
+  wsClient.addEventListener('open', () => {
+    state._wsConnected = true;
+    updateWsConnectionUI(true);
+  });
+  wsClient.addEventListener('close', () => {
+    state._wsConnected = false;
+    updateWsConnectionUI(false);
+    // Unlock chat if disconnect happens mid-stream (debounced: once per 15s)
+    if (state._chatLock) {
+      state._chatLock = false;
+      const sendBtn = document.getElementById('chat-send-btn');
+      const stopBtn = document.getElementById('chat-stop-btn');
+      if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = t('ui.send'); sendBtn.style.display = ''; }
+      if (stopBtn) stopBtn.style.display = 'none';
+      const cursors = document.querySelectorAll('.chat-cursor');
+      cursors.forEach(c => c.remove());
+      const now = Date.now();
+      if (!state._lastWsWarn || now - state._lastWsWarn > 15000) {
+        state._lastWsWarn = now;
+        showChatWarning('Connection lost — response may be incomplete');
+      }
+    }
+  });
+  if (wsClient.connected) {
+    // Already connected (e.g. reconnect before showApp re-runs)
+    updateWsConnectionUI(true);
+  }
+  wsClient.connect();
+  setupWsChatHandlers();
 }
 
 function updateUserMenu() {
@@ -135,7 +199,7 @@ document.getElementById('login-form')?.addEventListener('submit', async (e) => {
       errorEl.textContent = data.error || 'Login failed';
     }
   } catch (err) {
-    errorEl.textContent = 'Connection error';
+    errorEl.textContent = t('ui.connectionError');
   }
 });
 
@@ -148,11 +212,11 @@ document.getElementById('setup-form')?.addEventListener('submit', async (e) => {
   const errorEl = document.getElementById('login-error');
 
   if (password !== confirm) {
-    errorEl.textContent = 'Passwords do not match';
+    errorEl.textContent = t('toast.passwordsDontMatch');
     return;
   }
   if (password.length < 8) {
-    errorEl.textContent = 'Password must be at least 8 characters';
+    errorEl.textContent = t('toast.passwordTooShort');
     return;
   }
 
@@ -173,7 +237,7 @@ document.getElementById('setup-form')?.addEventListener('submit', async (e) => {
       errorEl.textContent = data.error || 'Setup failed';
     }
   } catch (err) {
-    errorEl.textContent = 'Connection error';
+    errorEl.textContent = t('ui.connectionError');
   }
 });
 
@@ -183,6 +247,7 @@ document.getElementById('setup-form')?.addEventListener('submit', async (e) => {
 function navigate(page, params = {}) {
   // Cleanup previous page resources
   stopLogsAutoRefresh();
+  stopOfficeAutoRefresh();
   if (state._logsDebounce) { clearTimeout(state._logsDebounce); state._logsDebounce = null; }
 
   state.page = page;
@@ -206,7 +271,7 @@ async function loadPage(page, params = {}) {
   if (!container) return;
 
   // Show loading
-  container.innerHTML = '<div class="loading">Loading</div>';
+  container.innerHTML = '<div class="loading" data-i18n="common.loading">Loading</div>';
 
   try {
     switch (page) {
@@ -240,11 +305,17 @@ async function loadPage(page, params = {}) {
       case 'logs':
         await loadLogs(container);
         break;
+      case 'mon':
+        await loadMonitoring(container);
+        break;
+      case 'office':
+        await loadOffice(container);
+        break;
       default:
-        container.innerHTML = `<div class="empty">Page not found</div>`;
+        container.innerHTML = `<div class="empty" data-i18n="auto.pageNotFound">Page not found</div>`;
     }
   } catch (err) {
-    container.innerHTML = `<div class="empty">Error loading page: ${err.message}</div>`;
+    container.innerHTML = `<div class="empty">Error loading page: ${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -260,6 +331,7 @@ async function loadChat(container) {
   } catch {}
   const profileOptions = profiles.map(p => `<option value="${p.name}">${p.name}${p.active ? ' ★' : ''}</option>`).join('');
   const defaultProfile = profiles.find(p => p.active)?.name || 'default';
+  state._defaultProfile = defaultProfile;
 
   // Sidebar state
   const sidebarCollapsed = state.chatSidebarOpen ? '' : ' collapsed';
@@ -275,10 +347,19 @@ async function loadChat(container) {
             <button class="chat-sidebar-close" onclick="toggleChatSidebar()" aria-label="Close sidebar">✕</button>
           </div>
           <input type="text" id="chat-session-search" class="search-input" placeholder="Search sessions..." />
-          <button class="btn btn-primary btn-sm" style="width:100%;margin-top:6px;" onclick="newChatSession()">+ New Chat</button>
+          <button class="btn btn-primary btn-sm" style="width:100%;margin-top:6px;" onclick="newChatSession()" data-i18n="auto.newChat">+ New Chat</button>
+        </div>
+        <div id="chat-agent-panel" class="chat-agent-panel">
+          <div class="chat-agent-panel-title" data-i18n="auto.activeAgent">🤖 Active Agent</div>
+          <div id="chat-agent-panel-body">
+            <!-- Populated by updateChatAgentPanel() -->
+          </div>
         </div>
         <div class="chat-sidebar-list" id="chat-sidebar-list">
-          <div class="loading">Loading sessions...</div>
+          <div class="loading" data-i18n="auto.loadingSessions">Loading sessions...</div>
+        </div>
+        <div id="subagent-panel" class="subagent-panel" style="display:none;">
+          <div class="subagent-panel-title" data-i18n="auto.subagents">Subagents</div>
         </div>
       </div>
       <div class="chat-sidebar-backdrop" id="chat-sidebar-backdrop" onclick="toggleChatSidebar()"></div>
@@ -289,40 +370,172 @@ async function loadChat(container) {
               <span>☰</span>
             </button>
             <div>
-              <div class="chat-title" id="chat-title">New Chat</div>
+              <div class="chat-title" id="chat-title" data-i18n="auto.newChat2">New Chat</div>
               <div class="chat-subtitle" id="chat-subtitle"></div>
             </div>
           </div>
           <div class="chat-header-right">
+            <span id="chat-gateway-badge" class="chat-header-badge" title="Gateway status">🌐 …</span>
             <span class="chat-header-model-badge" id="chat-model-badge" style="display:none;"></span>
-            <button class="btn btn-ghost btn-sm" onclick="renameChatSession()" title="Rename">✏</button>
-            <button class="btn btn-ghost btn-sm btn-danger" onclick="deleteChatSession()" title="Delete">🗑</button>
+            <button class="btn btn-ghost btn-sm" onclick="renameChatSession()" title="Rename">✏️</button>
+            <button class="btn btn-ghost btn-sm btn-danger" onclick="deleteChatSession()" title="Delete">🗑️</button>
           </div>
         </div>
         <div class="chat-messages" id="chat-messages"></div>
         <div class="chat-status-bar" id="chat-status-bar">
-          <span id="chat-status-session">—</span>
-          <span id="chat-status-tokens"></span>
-          <span id="chat-status-elapsed"></span>
+          <div class="chat-status-left">
+            <span id="agent-status-indicator" class="status-idle">ready</span>
+            <span id="chat-status-session" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">—</span>
+          </div>
+          <div class="chat-status-right">
+            <span id="chat-status-tokens"></span>
+            <span id="chat-status-elapsed"></span>
+          </div>
         </div>
         <div class="chat-input-area">
           <textarea id="chat-input" placeholder="Type a message... (Enter to send)" rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatMessage();}"></textarea>
-          <button class="btn btn-primary" id="chat-send-btn" onclick="sendChatMessage()">Send</button>
-          <button class="btn btn-danger btn-sm" id="chat-stop-btn" style="display:none;" onclick="stopChatStream()">Stop</button>
+          <span id="chat-queue-badge" class="queue-badge" style="display:none;">0</span>
+          <button class="btn btn-primary" id="chat-send-btn" onclick="sendChatMessage()" data-i18n="auto.send">Send</button>
+          <button class="btn btn-danger btn-sm" id="chat-stop-btn" style="display:none;" onclick="stopChatStream()" data-i18n="auto.stop">Stop</button>
         </div>
       </div>
     </div>
   `;
 
+  // ── Keyboard shortcuts ──
+  document.addEventListener('keydown', (e) => {
+    const active = document.activeElement;
+    const isInput = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA');
+
+    // Ctrl/Cmd + Enter = send
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      sendChatMessage();
+      return;
+    }
+
+    // Esc = stop stream or close modal
+    if (e.key === 'Escape') {
+      if (state._chatLock) {
+        e.preventDefault();
+        stopChatStream();
+      } else if (document.querySelector('.modal-overlay')) {
+        closeModal();
+      }
+      return;
+    }
+
+    // Ctrl/Cmd + N = new chat
+    if ((e.ctrlKey || e.metaKey) && e.key === 'n') {
+      e.preventDefault();
+      newChatSession();
+      return;
+    }
+
+    // Ctrl/Cmd + K = focus session search
+    if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+      e.preventDefault();
+      const search = document.getElementById('chat-session-search');
+      if (search) search.focus();
+      return;
+    }
+
+    // Ctrl/Cmd + [ = toggle sidebar
+    if ((e.ctrlKey || e.metaKey) && e.key === 'BracketLeft') {
+      e.preventDefault();
+      toggleChatSidebar();
+      return;
+    }
+
+    // Ctrl/Cmd + / = show shortcuts help
+    if ((e.ctrlKey || e.metaKey) && e.key === '/') {
+      e.preventDefault();
+      showModal({
+        title: 'Keyboard Shortcuts',
+        body: `<div style="display:grid;grid-template-columns:auto 1fr;gap:8px 16px;font-size:13px;">
+          <kbd>Ctrl+Enter</kbd><span data-i18n="auto.sendMessage">Send message</span>
+          <kbd>Esc</kbd><span data-i18n="auto.stopStreamCloseModal">Stop stream / close modal</span>
+          <kbd>Ctrl+N</kbd><span data-i18n="auto.newChat3">New chat</span>
+          <kbd>Ctrl+K</kbd><span data-i18n="auto.searchSessions">Search sessions</span>
+          <kbd>Ctrl+[</kbd><span data-i18n="auto.toggleSidebar">Toggle sidebar</span>
+          <kbd>Shift+Enter</kbd><span data-i18n="auto.newLineInInput">New line in input</span>
+        </div>`,
+        confirmText: 'Got it',
+      });
+      return;
+    }
+  });
+
+
   // Set default profile
   const profileSelect = document.getElementById('chat-profile');
   if (profileSelect) profileSelect.value = defaultProfile;
 
+  // Restore last-used profile from localStorage
+  const lastProfile = localStorage.getItem('hci-chat-profile');
+  if (lastProfile && profiles.some(p => p.name === lastProfile)) {
+    profileSelect.value = lastProfile;
+  }
+
+  // Cache profiles for the info panel
+  _chatInfoProfiles = profiles;
+
   // Load sessions
   await refreshChatSidebar();
+  updateChatAgentPanel().catch(() => {}); // Populate sidebar agent panel
 
-  // Profile change → refresh sidebar
-  profileSelect?.addEventListener('change', () => { refreshChatSidebar(); });
+  // Profile change → refresh sidebar + update gateway badge
+  // If switching to a non-default profile AND no active session (new-chat scenario),
+  // prompt the user to set it as their default agent.
+  profileSelect?.addEventListener('change', async () => {
+    const selected = profileSelect.value;
+    // Persist selection for page navigation
+    localStorage.setItem('hci-chat-profile', selected);
+    const hermesDefault = state._defaultProfile || 'default';
+    // Only prompt if: (1) not already the Hermes default, (2) no active session (new chat)
+    if (selected !== hermesDefault && !state._currentChatSession) {
+      const useDefault = await showModal({
+        title: 'Set as Default Agent?',
+        message: `Switch to <strong>${escapeHtml(selected)}</strong> for new chats? This will change your default agent.`,
+        buttons: [
+          { text: 'Cancel', primary: false, value: false },
+          { text: `Set as Default`, primary: true, value: true },
+        ],
+      });
+      if (useDefault?.action === true) {
+        // User confirmed — call hermes profile use to switch Hermes CLI default
+        try {
+          const csrfToken = state.csrfToken || '';
+          const res = await fetch('/api/profiles/use', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+            credentials: 'include',
+            body: JSON.stringify({ profile: selected }),
+          });
+          const data = await res.json();
+          if (data.ok) {
+            state._defaultProfile = selected;
+            profileSelect.value = selected; // Keep selector in sync with Hermes default
+            showToast(`Default agent set to ${selected}`, 'success');
+            updateChatAgentPanel().catch(() => {}); // Refresh agent panel
+          } else {
+            showToast(data.error || 'Failed to set default', 'error');
+            profileSelect.value = hermesDefault;
+          }
+        } catch (e) {
+          showToast(t('toast.setDefaultFailedPrefix') + e.message, 'error');
+          profileSelect.value = hermesDefault;
+        }
+      } else {
+        // User cancelled — apply selection for this session only (don't persist as default)
+        updateChatAgentPanel().catch(() => {});
+        updateGatewayBadge().catch(() => {});
+      }
+    }
+    refreshChatSidebar();
+    updateGatewayBadge().catch(() => {});
+    updateChatAgentPanel().catch(() => {}); // Refresh agent panel on profile change
+  });
 
   // Session search
   document.getElementById('chat-session-search')?.addEventListener('input', (e) => {
@@ -332,13 +545,22 @@ async function loadChat(container) {
     });
   });
 
-  // Auto-resize textarea
+  // Auto-resize textarea + save draft
   const textarea = document.getElementById('chat-input');
   if (textarea) {
     textarea.addEventListener('input', () => {
       textarea.style.height = 'auto';
       textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+      // Save draft per session
+      const sid = state._currentChatSession || '_new';
+      try { localStorage.setItem('hci_chat_draft_' + sid, textarea.value); } catch {}
     });
+    // Restore draft
+    const sid = state._currentChatSession || '_new';
+    try {
+      const draft = localStorage.getItem('hci_chat_draft_' + sid);
+      if (draft) { textarea.value = draft; textarea.dispatchEvent(new Event('input')); }
+    } catch {}
   }
 
   // Mobile: always start sidebar collapsed (ignore localStorage)
@@ -352,8 +574,8 @@ async function loadChat(container) {
   document.getElementById('chat-messages').innerHTML = `
     <div class="chat-welcome">
       <div class="chat-welcome-icon">💬</div>
-      <div class="chat-welcome-title">Welcome to Chat</div>
-      <div class="chat-welcome-sub">Select a conversation or start a new one</div>
+      <div class="chat-welcome-title" data-i18n="auto.welcomeToChat">Welcome to Chat</div>
+      <div class="chat-welcome-sub" data-i18n="auto.selectAConversationOrStartANewOne">Select a conversation or start a new one</div>
     </div>
   `;
 }
@@ -362,16 +584,16 @@ async function refreshChatSidebar() {
   const profile = document.getElementById('chat-profile')?.value || 'default';
   const listEl = document.getElementById('chat-sidebar-list');
   if (!listEl) return;
-  listEl.innerHTML = '<div class="loading">Loading...</div>';
+  listEl.innerHTML = '<div class="loading" data-i18n="auto.loading">Loading...</div>';
 
   try {
     const res = await fetch(`/api/all-sessions?profile=${encodeURIComponent(profile)}`, { credentials: 'include' });
-    if (!res.ok) { listEl.innerHTML = '<div class="error-msg">Failed to load</div>'; return; }
+    if (!res.ok) { listEl.innerHTML = '<div class="error-msg" data-i18n="auto.failedToLoad">Failed to load</div>'; return; }
     const data = await res.json();
     let sessions = (data.sessions || []).filter(s => (s.messageCount > 0) || (s.message_count > 0) || (s.title && s.title !== '—'));
 
     if (sessions.length === 0) {
-      listEl.innerHTML = '<div style="text-align:center;color:var(--fg-subtle);padding:20px;font-size:12px;\">No conversations yet</div>';
+      listEl.innerHTML = '<div style="text-align:center;color:var(--fg-subtle);padding:20px;font-size:12px;\" data-i18n="auto.noConversationsYet">No conversations yet</div>';
       return;
     }
 
@@ -403,11 +625,20 @@ async function refreshChatSidebar() {
     // Add normalized source to sessions
     sessions = sessions.map(s => ({ ...s, _source: normalizeSource(s) }));
 
+    // Sort: pinned first, then by last activity
+    const pinned = JSON.parse(localStorage.getItem('hci_pinned_sessions') || '[]');
+    sessions.sort((a, b) => {
+      const ap = pinned.includes(a.id) ? 1 : 0;
+      const bp = pinned.includes(b.id) ? 1 : 0;
+      if (ap !== bp) return bp - ap;
+      return 0; // preserve API order (already sorted by last activity)
+    });
+
     // Get unique sources for filter
     const uniqueSources = [...new Set(sessions.map(s => s._source))].sort();
 
     // Build filter HTML
-    const filterOptions = `<option value="all">All</option>` +
+    const filterOptions = `<option value="all" data-i18n="auto.all">All</option>` +
       uniqueSources.map(src => `<option value="${src}">${sourceLabels[src] || src}</option>`).join('');
 
     // Check active filter (persist in data attr)
@@ -435,8 +666,9 @@ async function refreshChatSidebar() {
       const model = s.model || '';
       const modelTag = model ? `<span class="session-model-tag">${escapeHtml(model.split('/').pop())}</span>` : '';
       const sourceIcon = { telegram: '💬', discord: '💜', slack: '🟡', cron: '⏰', api_server: '🔌', cli: '⌨️', web: '🌐', other: '📝' }[s._source] || '';
-      html += `<div class="chat-session-item ${isActive ? 'active' : ''}" data-sid="${s.id}" data-title="${escapeHtml(title)}" onclick="loadChatSession('${s.id}')">
-        <div class="chat-session-title">${sourceIcon} ${escapeHtml(title.substring(0, 40))}</div>
+      const isPinned = pinned.includes(s.id);
+      html += `<div class="chat-session-item ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''}" data-sid="${s.id}" data-title="${escapeHtml(title)}" onclick="loadChatSession('${s.id}')">
+        <div class="chat-session-title">${sourceIcon} ${escapeHtml(title.substring(0, 40))}<button class="session-pin-btn" onclick="event.stopPropagation();togglePinSession('${s.id}')" title="${isPinned?'Unpin':'Pin'}">${isPinned?'📌':'○'}</button></div>
         <div class="chat-session-meta">
           <span>${msgs} msgs</span>
           ${modelTag}
@@ -460,9 +692,19 @@ function filterChatBySource(value) {
 }
 
 // Reload current session messages from DB (silent — no loading indicator)
+let _reloadInProgress = false;
 async function reloadCurrentSessionMessages() {
   const sessionId = state._currentChatSession;
   if (!sessionId) return;
+  // Guard: prevent concurrent calls (e.g., double finalizeWsChat race)
+  if (_reloadInProgress) {
+    console.warn('[Chat] reload already in progress, skipping duplicate call');
+    return;
+  }
+  _reloadInProgress = true;
+  // Capture the session ID at call time so a concurrent session
+  // switch cannot cause us to overwrite the new session's view with old data.
+  const expectedSession = sessionId;
   const profile = document.getElementById('chat-profile')?.value || 'default';
   const container = document.getElementById('chat-messages');
   const statsEl = document.getElementById('chat-status-session');
@@ -472,8 +714,15 @@ async function reloadCurrentSessionMessages() {
 
   try {
     const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}`, { credentials: 'include' });
-    if (!r.ok) return;
+    if (!r.ok) { console.warn('[Chat] reload messages failed:', r.status); return; }
     const data = await r.json();
+
+    // Stale guard: if the session switched while the fetch was in flight,
+    // discard the response to avoid overwriting the new session's view.
+    if (state._currentChatSession !== expectedSession) {
+      console.warn('[Chat] session changed during reload, discarding stale response');
+      return;
+    }
 
     // Token info
     if (tokensEl && data.session) {
@@ -491,7 +740,7 @@ async function reloadCurrentSessionMessages() {
       modelBadge.style.display = 'none';
     }
 
-    if (!data.messages || data.messages.length === 0) return;
+    if (!data.messages || data.messages.length === 0) { console.warn('[Chat] no messages in session'); _reloadInProgress = false; return; }
 
     // Rebuild messages cleanly
     container.innerHTML = '';
@@ -502,10 +751,11 @@ async function reloadCurrentSessionMessages() {
     }
     highlightCodeBlocks(container);
     container.scrollTop = container.scrollHeight;
-  } catch {}
+  } catch (e) { console.error('[Chat] reload messages error:', e); }
+  finally { _reloadInProgress = false; }
 }
 
-async function loadChatSession(sessionId) {
+async function loadChatSession(sessionId, offset = 0) {
   const profile = document.getElementById('chat-profile')?.value || 'default';
   const container = document.getElementById('chat-messages');
   const titleEl = document.getElementById('chat-title');
@@ -514,8 +764,22 @@ async function loadChatSession(sessionId) {
   const tokensEl = document.getElementById('chat-status-tokens');
   if (!container) return;
   state._currentChatSession = sessionId || null;
+  if (sessionId) localStorage.setItem('hci-last-session', sessionId);
+  else localStorage.removeItem('hci-last-session');
   if (statsEl) statsEl.textContent = sessionId || '—';
-  container.innerHTML = '<div class="loading">Loading messages...</div>';
+
+  // Restore draft for this session
+  const draftInput = document.getElementById('chat-input');
+  if (draftInput) {
+    try {
+      const draft = localStorage.getItem('hci_chat_draft_' + (sessionId || '_new'));
+      draftInput.value = draft || '';
+      draftInput.style.height = 'auto';
+      if (draft) draftInput.style.height = Math.min(draftInput.scrollHeight, 120) + 'px';
+    } catch {}
+  }
+
+  container.innerHTML = '<div class="loading" data-i18n="auto.loadingMessages">Loading messages...</div>';
 
   // Highlight active in sidebar
   document.querySelectorAll('.chat-session-item').forEach(el => {
@@ -528,8 +792,8 @@ async function loadChatSession(sessionId) {
   }
 
   try {
-    const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}`, { credentials: 'include' });
-    if (!r.ok) { container.innerHTML = '<div class="error-msg">Failed to load messages</div>'; return; }
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}&offset=${offset}&limit=50`, { credentials: 'include' });
+    if (!r.ok) { container.innerHTML = '<div class="error-msg" data-i18n="auto.failedToLoadMessages">Failed to load messages</div>'; return; }
     const data = await r.json();
     if (titleEl) {
       titleEl.textContent = toDisplayText(resolveSessionDisplayTitle({ sessionId, data }));
@@ -553,18 +817,48 @@ async function loadChatSession(sessionId) {
     }
 
     if (!data.messages || data.messages.length === 0) {
-      container.innerHTML = '<div style="text-align:center;color:var(--fg-subtle);padding:40px;font-size:13px;">No messages yet</div>';
+      container.innerHTML = '<div style="text-align:center;color:var(--fg-subtle);padding:40px;font-size:13px;" data-i18n="auto.noMessagesYet">No messages yet</div>';
       return;
     }
 
-    container.innerHTML = '';
+    // Lazy load older: prepend if offset > 0, else replace
+    if (offset === 0) {
+      container.innerHTML = '';
+    }
+    const frag = document.createDocumentFragment();
     for (const m of data.messages) {
       if (!shouldRenderChatMessage(m)) continue;
       const rendered = renderChatMessage(m);
-      if (rendered) container.appendChild(rendered);
+      if (rendered) frag.appendChild(rendered);
+    }
+    if (offset > 0 && container.firstChild) {
+      container.insertBefore(frag, container.firstChild);
+      // Remove old "Load older" button
+      const oldBtn = container.querySelector('.load-older-btn');
+      if (oldBtn) oldBtn.remove();
+    } else {
+      container.appendChild(frag);
+    }
+    // Add "Load older" button if we got 50 messages (more likely exist)
+    if (data.messages.length === 50 && offset === 0) {
+      const loadBtn = document.createElement('button');
+      loadBtn.className = 'load-older-btn';
+      loadBtn.textContent = '↑ Load older messages';
+      loadBtn.onclick = () => {
+        loadBtn.textContent = t('ui.loading');
+        loadBtn.disabled = true;
+        loadChatSession(sessionId, offset + 50).then(() => {
+          loadBtn.remove();
+        }).catch(() => {
+          loadBtn.textContent = '↑ Load older messages';
+          loadBtn.disabled = false;
+        });
+      };
+      container.insertBefore(loadBtn, container.firstChild);
+
     }
     highlightCodeBlocks(container);
-    container.scrollTop = container.scrollHeight;
+    if (offset === 0) container.scrollTop = container.scrollHeight;
   } catch (e) {
     container.innerHTML = '<div class="error-msg">' + escapeHtml(e.message) + '</div>';
   }
@@ -580,7 +874,15 @@ function renderChatMessage(msg) {
     system: { label: 'System', icon: '⚙️', cls: 'msg-system' },
   };
   const c = labels[role] || labels.system;
-  const ts = msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+  // Include the date alongside the time so messages from older sessions are
+  // identifiable at a glance (the header used to show only HH:MM, which read
+  // as "today" regardless of the actual send date).
+  const ts = msg.timestamp
+    ? new Date(msg.timestamp * 1000).toLocaleString([], {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      })
+    : '';
 
   const div = document.createElement('div');
   div.className = `chat-msg ${c.cls}`;
@@ -588,7 +890,7 @@ function renderChatMessage(msg) {
   // Header
   const header = document.createElement('div');
   header.className = 'msg-header';
-  header.innerHTML = `<span class="msg-header-label">${c.icon} ${c.label}</span>${ts ? `<span class="msg-header-time">${ts}</span>` : ''}`;
+  header.innerHTML = `<span class="msg-header-label">${c.icon} ${c.label}</span>${ts ? `<span class="msg-header-time">${ts}</span>` : ''}<button class="msg-menu-btn" onclick="toggleMsgMenu(this, '${role}')" title="Message options">⋮</button>`;
   div.appendChild(header);
 
   // Tool calls — render as collapsible cards
@@ -598,7 +900,7 @@ function renderChatMessage(msg) {
       const name = fn.name || tc.name || 'unknown';
       let args = {};
       try { args = typeof fn.arguments === 'string' ? JSON.parse(fn.arguments) : (fn.arguments || {}); } catch {}
-      
+
       const toolCard = document.createElement('div');
       toolCard.className = 'tool-call-card';
       toolCard.innerHTML = `
@@ -650,7 +952,7 @@ function renderChatMessage(msg) {
   if (msg.reasoning) {
     const rd = document.createElement('details');
     rd.style.cssText = 'margin-top:8px;';
-    rd.innerHTML = `<summary style="cursor:pointer;font-size:11px;color:var(--fg-subtle);">💭 Reasoning</summary><div class="msg-tool-result" style="margin-top:4px;">${escapeHtml(toDisplayText(msg.reasoning).substring(0, 2000))}</div>`;
+    rd.innerHTML = `<summary style="cursor:pointer;font-size:11px;color:var(--fg-subtle);" data-i18n="auto.reasoning">💭 Reasoning</summary><div class="msg-tool-result" style="margin-top:4px;">${escapeHtml(toDisplayText(msg.reasoning).substring(0, 2000))}</div>`;
     div.appendChild(rd);
   }
 
@@ -663,7 +965,7 @@ function newChatSession() {
 
   // Reset UI
   const titleEl = document.getElementById('chat-title');
-  if (titleEl) titleEl.textContent = 'New Chat';
+  if (titleEl) titleEl.textContent = t('ui.newChat');
   const subtitleEl = document.getElementById('chat-subtitle');
   if (subtitleEl) subtitleEl.textContent = '';
   const statusSessionEl = document.getElementById('chat-status-session');
@@ -674,11 +976,17 @@ function newChatSession() {
   if (messagesEl) messagesEl.innerHTML = `
     <div class="chat-welcome">
       <div class="chat-welcome-icon">💬</div>
-      <div class="chat-welcome-title">New conversation</div>
-      <div class="chat-welcome-sub">Type a message to start</div>
+      <div class="chat-welcome-title" data-i18n="auto.newConversation">New conversation</div>
+      <div class="chat-welcome-sub" data-i18n="auto.typeAMessageToStart">Type a message to start</div>
     </div>
   `;
   document.querySelectorAll('.chat-session-item').forEach(el => el.classList.remove('active'));
+
+  // Reset profile dropdown to default/active profile
+  const profileSelect = document.getElementById('chat-profile');
+  if (profileSelect && state._defaultProfile) {
+    profileSelect.value = state._defaultProfile;
+  }
 
   return null;
 }
@@ -697,16 +1005,69 @@ function toggleChatSidebar() {
   }
 }
 
-// Stop active chat stream (Gateway API or CLI)
+// Update the sidebar agent panel with current profile data
+let _chatInfoProfiles = [];
+async function updateChatAgentPanel() {
+  const body = document.getElementById('chat-agent-panel-body');
+  if (!body) return;
+
+  // Reuse cached profiles from sidebar refresh
+  let profiles = _chatInfoProfiles;
+  if (!profiles.length) {
+    body.innerHTML = '<div style="color:var(--fg-muted);font-size:12px;text-align:center;padding:10px;" data-i18n="auto.loading">Loading...</div>';
+    return;
+  }
+
+  const defaultAgent = profiles.find(p => p.active);
+  const selectedName = document.getElementById('chat-profile')?.value || defaultAgent?.name || 'default';
+  const selectedProfile = profiles.find(p => p.name === selectedName) || defaultAgent;
+
+  // Current agent — prominent display
+  const currentCard = selectedProfile ? `
+    <div class="agent-current">
+      <span class="agent-status-dot ${selectedProfile.gateway === 'running' ? 'running' : 'stopped'}"></span>
+      <span class="agent-current-name">${escapeHtml(selectedProfile.name)}</span>
+      ${selectedProfile.active ? '<span class="agent-badge-default">★ default</span>' : ''}
+    </div>
+    <div class="agent-current-meta">${escapeHtml(selectedProfile.model || '—')}</div>
+  ` : '';
+
+  // All agents compact list
+  const agentItems = profiles.map(p => {
+    const isRunning = p.gateway === 'running';
+    return `<div class="agent-list-item" onclick="switchChatProfile('${escapeHtml(p.name)}')" style="cursor:pointer;" title="Switch to ${escapeHtml(p.name)}">
+      <span class="agent-list-dot ${isRunning ? 'running' : 'stopped'}"></span>
+      <span class="agent-list-name">${escapeHtml(p.name)}</span>
+      <span class="agent-list-model">${escapeHtml((p.model || '—').split('/').pop())}</span>
+      ${p.active ? '<span class="agent-badge-default">★</span>' : ''}
+    </div>`;
+  }).join('');
+
+  body.innerHTML = currentCard + `<div class="agent-list">${agentItems}</div>`;
+}
+
+function switchChatProfile(name) {
+  const sel = document.getElementById('chat-profile');
+  if (sel) {
+    sel.value = name;
+    sel.dispatchEvent(new Event('change'));
+  }
+}
+
+// Stop active chat stream (Gateway API or CLI or WS)
 function stopChatStream() {
   if (state._currentStreamReader) {
     state._currentStreamReader.cancel().catch(() => {});
     state._currentStreamReader = null;
   }
+  // Also send WS stop if connected
+  if (wsClient.connected) {
+    wsClient.chatStop();
+  }
   state._chatLock = false;
   const sendBtn = document.getElementById('chat-send-btn');
   const stopBtn = document.getElementById('chat-stop-btn');
-  if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send'; }
+  if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = t('ui.send'); }
   if (stopBtn) stopBtn.style.display = 'none';
   // Remove cursor
   const cursor = document.querySelector('.chat-cursor');
@@ -715,7 +1076,7 @@ function stopChatStream() {
 
 async function renameChatSession(sessionId = 0) {
   const sid = sessionId || state._currentChatSession;
-  if (!sid) return showToast('No session selected', 'info');
+  if (!sid) return showToast(t('toast.noSessionSelected'), 'info');
   const t = await showModal({ title: 'Rename Session', message: 'Enter a new title.', inputs: [{ placeholder: 'New title' }], buttons: [{ text: 'Cancel', value: false }, { text: 'Rename', value: true, primary: true }] });
   if (!t?.action || !t.inputs?.[0]) return;
   const n = t.inputs[0].trim();
@@ -723,30 +1084,38 @@ async function renameChatSession(sessionId = 0) {
   try {
     const profile = document.getElementById('chat-profile')?.value || 'default';
     const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': state.csrfToken || '' }, body: JSON.stringify({ title: n, profile }), credentials: 'include' });
-    if (r.ok) { showToast('Session renamed', 'success'); document.getElementById('chat-title').textContent = n; refreshChatSidebar(); } else showToast('Rename failed', 'error');
-  } catch (e) { showToast('Rename failed: ' + e.message, 'error'); }
+    if (r.ok) { showToast(t('toast.sessionRenamed'), 'success'); document.getElementById('chat-title').textContent = n; refreshChatSidebar(); } else showToast(t('toast.renameFailed'), 'error');
+  } catch (e) { showToast(t('toast.renameFailedPrefix') + e.message, 'error'); }
 }
 
 async function deleteChatSession(sessionId = 0) {
   const sid = sessionId || state._currentChatSession;
-  if (!sid) return showToast('No session selected', 'info');
+  if (!sid) return showToast(t('toast.noSessionSelected'), 'info');
   const confirmResult = await showModal({ title: 'Delete Session', message: 'Delete this session? This cannot be undone.', buttons: [{ text: 'Cancel', value: false }, { text: 'Delete', value: true, primary: true }] });
   if (!confirmResult?.action) return;
   try {
     const profile = document.getElementById('chat-profile')?.value || 'default';
     const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}?profile=${encodeURIComponent(profile)}`, { method: 'DELETE', headers: { 'X-CSRF-Token': state.csrfToken || '' }, credentials: 'include' });
-    if (r.ok) { showToast('Session deleted', 'success'); newChatSession(); refreshChatSidebar(); } else showToast('Delete failed', 'error');
-  } catch (e) { showToast('Delete failed: ' + e.message, 'error'); }
+    if (r.ok) { showToast(t('toast.sessionDeleted'), 'success'); newChatSession(); refreshChatSidebar(); } else showToast(t('toast.deleteFailed'), 'error');
+  } catch (e) { showToast(t('toast.deleteFailedPrefix') + e.message, 'error'); }
 }
 
 // ── Update chat header with session info ──
+
+function updateQueueBadge() {
+  const q = state._chatQueue || [];
+  const badge = document.getElementById('chat-queue-badge');
+  if (!badge) return;
+  badge.textContent = q.length;
+  badge.style.display = q.length > 0 ? '' : 'none';
+}
 function updateChatHeader() {
   const sid = state._currentChatSession;
   const titleEl = document.getElementById('chat-title');
   const subtitleEl = document.getElementById('chat-subtitle');
   const profile = document.getElementById('chat-profile')?.value || 'default';
   if (!sid) {
-    if (titleEl) titleEl.textContent = 'New Chat';
+    if (titleEl) titleEl.textContent = t('ui.newChat');
     if (subtitleEl) subtitleEl.textContent = profile !== 'default' ? `Profile: ${profile}` : '';
     return;
   }
@@ -758,27 +1127,48 @@ function updateChatHeader() {
 }
 
 async function sendChatMessage() {
-  if (state._chatLock) return;
   const input = document.getElementById('chat-input');
   const text = input?.value?.trim();
   if (!text) return;
+
+  // Queue if busy
+  if (state._chatLock) {
+    if (!state._chatQueue) state._chatQueue = [];
+    state._chatQueue.push(text);
+    input.value = '';
+    input.style.height = 'auto';
+    updateQueueBadge();
+    return;
+  }
   const profile = document.getElementById('chat-profile')?.value || 'default';
   const sessionId = state._currentChatSession || null;
   input.value = '';
   input.style.height = 'auto';
   state._chatLock = true;
+  // Initialize optimistic + dedup state
+  if (!state._optMessages) state._optMessages = new Map();
+  if (!state._recentMessages) state._recentMessages = { buf: [], max: 20 };
+
+  // Clear draft
+  try { localStorage.removeItem('hci_chat_draft_' + (state._currentChatSession || '_new')); } catch {}
   const btn = document.getElementById('chat-send-btn');
   if (btn) { btn.disabled = true; btn.textContent = '...'; }
   const messagesDiv = document.getElementById('chat-messages');
   if (messagesDiv) {
     const existing = messagesDiv.querySelector('[style*="text-align:center"]');
     if (existing) existing.remove();
-    messagesDiv.appendChild(createMessageDiv('user', text));
+    // Optimistic ID: tag user message so we can swap if needed
+    const optId = 'opt-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+    const msgEl = createMessageDiv('user', text, optId);
+    messagesDiv.appendChild(msgEl);
+    // Track for dedup + optimistic swap
+    state._optMessages.set(optId, { text, el: msgEl, ts: Date.now() });
+    addToDedupBuf('user', text);
   }
   const streamEl = document.createElement('div');
   streamEl.id = 'chat-streaming';
   streamEl.className = 'chat-msg msg-assistant';
-  streamEl.innerHTML = '<div class="msg-header"><span class="msg-header-label">🤖 Assistant</span></div><div class="msg-body"><span class="streaming-text" id="gw-stream-text"><span class="chat-cursor">▊</span></span></div>';
+  streamEl.innerHTML = '<div class="msg-header"><span class="msg-header-label" data-i18n="auto.assistant">🤖 Assistant</span></div><div class="msg-body"><span class="streaming-text" id="gw-stream-text"><span class="chat-cursor">▊</span></span></div>';
   if (messagesDiv) messagesDiv.appendChild(streamEl);
   if (messagesDiv) messagesDiv.scrollTop = messagesDiv.scrollHeight;
   const contentDiv = streamEl.querySelector('#gw-stream-text') || streamEl.querySelector('.msg-body');
@@ -789,19 +1179,31 @@ async function sendChatMessage() {
   if (btn) { btn.disabled = true; btn.style.display = 'none'; }
   if (stopBtn) stopBtn.style.display = 'inline-flex';
   try {
-    // All profiles use Gateway API (default, soci, cuan, david)
-    await sendViaGatewayAPI(text, profile, sessionId, contentDiv, messagesDiv, startTime);
-  } catch (gwErr) {
-    console.warn('[Chat] Gateway API failed, falling back to CLI:', gwErr.message);
-    try {
-      await sendViaCLI(text, profile, sessionId, contentDiv, messagesDiv, startTime);
-    } catch (cliErr) {
-      if (contentDiv) contentDiv.innerHTML = renderChatContent(fullContent) + '<div style="color:var(--red);margin-top:8px;">Error: ' + escapeHtml(cliErr.message) + '</div>';
+    // Prefer WebSocket for real-time events (thinking, tool progress, streaming)
+    if (wsClient.connected) {
+      try {
+        await sendViaWebSocket(text, profile, sessionId);
+        return; // WS success — done
+      } catch (wsErr) {
+        console.warn('[Chat] WS failed, trying Gateway API:', wsErr.message);
+      }
     }
+    // Try Gateway API directly (fast, structured SSE events)
+    try {
+      await sendViaGatewayAPI(text, profile, sessionId, contentDiv, messagesDiv, startTime);
+      return;
+    } catch (gwErr) {
+      console.warn('[Chat] Gateway API failed, falling back to CLI:', gwErr.message);
+    }
+    // Last resort: raw CLI (slow, stdout parsing)
+    await sendViaCLI(text, profile, sessionId, contentDiv, messagesDiv, startTime);
+  } catch (cliErr) {
+    console.error('[Chat] CLI failed:', cliErr.message);
+    if (contentDiv) contentDiv.innerHTML = renderChatContent(fullContent) + '<div style="color:var(--red);margin-top:8px;">Error: ' + escapeHtml(cliErr.message) + '</div>';
   } finally {
     state._chatLock = false;
     state._currentStreamReader = null;
-    if (btn) { btn.disabled = false; btn.textContent = 'Send'; btn.style.display = ''; }
+    if (btn) { btn.disabled = false; btn.textContent = t('ui.send'); btn.style.display = ''; }
     if (stopBtn) stopBtn.style.display = 'none';
     // Remove lingering cursor
     const cursors = contentDiv?.querySelectorAll('.chat-cursor');
@@ -924,7 +1326,564 @@ function handleGatewayEvent(evt, contentDiv, messagesDiv, toolCards) {
       // Don't overwrite session_id from hci.session or header
       if (!state._currentChatSession) state._currentChatSession = evt.response.id;
     }
+  } else if (t === 'artifact.created') {
+    handleArtifact(evt.artifact || evt);
+  } else if (t === 'artifact.chunk') {
+    // Accumulate artifact chunks — append to latest artifact card
+    const messagesDiv = document.getElementById('chat-messages');
+    const lastArtifact = messagesDiv?.querySelector('.artifact-card:last-of-type');
+    if (lastArtifact) {
+      const contentEl = lastArtifact.querySelector('.artifact-content');
+      if (contentEl && evt.chunk) {
+        contentEl.textContent = (contentEl.textContent || '') + evt.chunk;
+      }
+    }
+  } else if (t === 'subagent.completed' || t === 'chat.subagent.done') {
+    handleSubagentEvent('done', evt.payload || evt);
   }
+}
+
+// ── WebSocket Chat (TUI events) ──
+function setupWsChatHandlers() {
+  wsClient.addEventListener('message', (ev) => {
+    const msg = ev.detail;
+    switch (msg.type) {
+      case 'chat.thinking':
+        handleThinkingDelta(msg.delta);
+        break;
+      case 'chat.reasoning':
+        handleReasoningDelta(msg.delta);
+        break;
+      case 'chat.start':
+        handleMessageStart();
+        break;
+      case 'chat.text':
+        handleTextDelta(msg.delta);
+        break;
+      case 'chat.status':
+        handleStatusUpdate(msg.status, msg.kind);
+        break;
+      case 'chat.tool.generating':
+        handleToolGenerating(msg.name);
+        break;
+      case 'chat.tool.start':
+        handleToolStart(msg.tool_id, msg.name, msg.context);
+        break;
+      case 'chat.tool.progress':
+        handleToolProgress(msg.name, msg.preview);
+        break;
+      case 'chat.tool.done':
+        handleToolDone(msg.tool_id, msg.name, msg.summary, msg.error, msg.inline_diff);
+        break;
+      case 'chat.artifact':
+        handleArtifact(msg.artifact || msg);
+        break;
+      case 'chat.session':
+        state._currentChatSession = msg.session_id;
+        state._sessionInfo = msg.info;
+        swapOptimisticMessage(msg.session_id);
+        updateChatHeader();
+        break;
+      case 'chat.done':
+        finalizeWsChat();
+        break;
+      case 'chat.error':
+        // Bridge errors are recoverable — CLI fallback handles it.
+        // Show as warning, not fatal error.
+        showChatWarning(msg.error);
+        break;
+      case 'chat.clarify':
+        showClarifyModal(msg.question, msg.choices, msg.request_id);
+        break;
+      case 'chat.approval':
+        showApprovalModal(msg.command, msg.description);
+        break;
+      case 'chat.sudo':
+        showSudoModal(msg.request_id);
+        break;
+      case 'chat.secret':
+        showSecretModal(msg.env_var, msg.prompt, msg.request_id);
+        break;
+      case 'chat.subagent.start':
+      case 'chat.subagent.progress':
+      case 'chat.subagent.complete':
+        handleSubagentEvent(msg.type, msg.payload);
+        break;
+      case 'tui.ready':
+        console.log('[TUI] Gateway ready');
+        break;
+      case 'tui.stderr':
+        // Surface actionable TUI messages; filter routine noise
+        if (msg.line && !/(?:INFO|DEBUG|^\s*$)/.test(msg.line)) {
+          showChatWarning(msg.line);
+        }
+        break;
+      case 'tui.error':
+        showChatError('TUI gateway error: ' + (msg.error || 'unknown'));
+        break;
+    }
+  });
+}
+
+function handleThinkingDelta(delta) {
+  const messagesDiv = document.getElementById('chat-messages');
+  if (!messagesDiv) return;
+  const panel = ensureThinkingPanel(messagesDiv);
+  const textEl = panel.querySelector('.thinking-text');
+  if (textEl) {
+    textEl.textContent += delta;
+    panel.scrollTop = panel.scrollHeight;
+  }
+}
+
+function handleReasoningDelta(delta) {
+  // Same as thinking for now
+  handleThinkingDelta(delta);
+}
+
+function handleMessageStart() {
+  hideThinkingPanel();
+  const messagesDiv = document.getElementById('chat-messages');
+  if (!messagesDiv) return;
+  let streamEl = document.getElementById('chat-streaming');
+  if (!streamEl) {
+    streamEl = document.createElement('div');
+    streamEl.id = 'chat-streaming';
+    streamEl.className = 'chat-msg msg-assistant chat-streaming';
+    streamEl.innerHTML = '<div class="msg-header"><span class="msg-header-label" data-i18n="auto.assistant">🤖 Assistant</span></div><div class="msg-body"><span id="gw-stream-text"></span><span class="chat-cursor" style="animation:blink 1s infinite;">▊</span></div>';
+    messagesDiv.appendChild(streamEl);
+  }
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function handleTextDelta(delta) {
+  const messagesDiv = document.getElementById('chat-messages');
+  if (!messagesDiv) return;
+  // Re-query each time — streaming element may have been replaced by
+  // reloadCurrentSessionMessages() between callback invocations.
+  const streamEl = document.getElementById('chat-streaming');
+  if (!streamEl || !document.contains(streamEl)) return;
+  const body = streamEl.querySelector('.msg-body');
+  if (!body) return;
+  let span = body.querySelector('#gw-stream-text');
+  const cursor = body.querySelector('.chat-cursor');
+  if (!span) {
+    span = document.createElement('span');
+    span.id = 'gw-stream-text';
+    // Guard: cursor may have been removed by reloadCurrentSessionMessages
+    if (cursor && body.contains(cursor)) {
+      body.insertBefore(span, cursor);
+    } else {
+      body.appendChild(span);
+    }
+  }
+  span.textContent += delta;
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function handleStatusUpdate(status, kind) {
+  const statusEl = document.getElementById('chat-status-bar');
+  if (statusEl) {
+    const sessionSpan = statusEl.querySelector('#chat-status-session');
+    if (sessionSpan) sessionSpan.textContent = status || '';
+  }
+  // Also update a global status indicator
+  const indicator = document.getElementById('agent-status-indicator');
+  if (indicator) {
+    indicator.textContent = status || 'ready';
+    indicator.className = `status-${kind || 'idle'}`;
+  }
+}
+
+function handleToolGenerating(name) {
+  // Tool schema being generated — show subtle indicator
+  console.log('[Tool] Generating:', name);
+}
+
+function handleToolStart(toolId, name, context) {
+  hideThinkingPanel();
+  const tc = ensureToolCards();
+  const messagesDiv = document.getElementById('chat-messages');
+  const streamEl = document.getElementById('chat-streaming');
+  // Guard: if streaming element is no longer in the DOM (e.g. replaced by
+  // finalizeWsChat or a new message cycle), skip tool card insertion.
+  // The messages will be reloaded from DB when the stream finalizes.
+  if (!streamEl || !document.contains(streamEl)) return;
+  const targetDiv = streamEl.querySelector('.msg-body');
+  if (!targetDiv || !document.contains(targetDiv)) return;
+  const card = addToolCallCard(targetDiv, toolId, name, context);
+  tc.set(toolId, card);
+  if (messagesDiv) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  // Live tool count indicator
+  state._wsToolCount = (state._wsToolCount || 0) + 1;
+  updateToolCountUI();
+}
+
+function handleToolProgress(name, preview) {
+  const tc = ensureToolCards();
+  for (const [id, el] of tc) {
+    // Guard: skip if card is no longer in DOM (orphaned by finalizeWsChat)
+    if (!document.contains(el)) continue;
+    const previewEl = el.querySelector('.tool-card-preview');
+    if (previewEl && preview) previewEl.textContent = preview;
+  }
+}
+
+function handleToolDone(toolId, name, summary, error, inlineDiff) {
+  const tc = ensureToolCards();
+  const card = tc.get(toolId);
+  if (!card) return; // card already removed (e.g. by finalizeWsChat)
+  // Guard: if the card is no longer in the DOM (streaming element replaced),
+  // skip DOM update — messages will be reloaded from DB.
+  if (!document.contains(card)) return;
+  const streamEl = document.getElementById('chat-streaming');
+  if (!streamEl || !document.contains(streamEl)) return;
+  const statusEl = card.querySelector('.tool-card-status');
+  if (statusEl) {
+    statusEl.textContent = error ? 'error' : 'done';
+    statusEl.className = `tool-card-status ${error ? 'error' : 'done'}`;
+  }
+  const resultEl = card.querySelector('.tool-card-result');
+  if (resultEl) {
+    let resultText = error || '';
+    if (!error && inlineDiff) {
+      resultText = inlineDiff;
+    } else if (!error && summary) {
+      resultText = summary;
+    }
+    // 4000-char truncation with expand-on-click
+    if (resultText.length > 4000) {
+      resultEl.innerHTML = `
+        <pre class="tool-result-truncated">${escapeHtml(resultText.substring(0, 4000))}</pre>
+        <button class="tool-expand-btn" onclick="this.previousElementSibling.classList.toggle('tool-result-truncated'); this.previousElementSibling.classList.toggle('tool-result-full'); this.textContent = this.previousElementSibling.classList.contains('tool-result-full') ? 'Show less' : 'Show more (${(resultText.length - 4000).toLocaleString()} more chars)';">Show more (${(resultText.length - 4000).toLocaleString()} more chars)</button>`;
+      resultEl.classList.add('has-expand');
+    } else {
+      resultEl.innerHTML = `<pre>${escapeHtml(resultText)}</pre>`;
+    }
+  }
+  tc.delete(toolId);
+  // Decrement live tool count
+  state._wsToolCount = Math.max(0, (state._wsToolCount || 1) - 1);
+  updateToolCountUI();
+}
+
+function handleSubagentEvent(type, payload) {
+  // Show panel if hidden
+  const panel = document.getElementById('subagent-panel');
+  if (panel) panel.style.display = '';
+
+  const id = payload.subagent_id;
+  let el = document.getElementById(`subagent-${id}`);
+
+  if (type === 'chat.subagent.start') {
+    if (!el) {
+      el = document.createElement('div');
+      el.id = `subagent-${id}`;
+      el.className = 'subagent-item';
+      panel.appendChild(el);
+    }
+    el.innerHTML = `<span class="subagent-status running">●</span> ${escapeHtml(payload.goal?.slice(0, 40) || 'Subagent')} <span class="subagent-model">${escapeHtml(payload.model || '')}</span>`;
+  } else if (type === 'chat.subagent.progress') {
+    if (el) {
+      const progress = payload.iteration ? ` (${payload.iteration}/${payload.tool_count || '?'})` : '';
+      el.innerHTML = `<span class="subagent-status running">●</span> ${escapeHtml(payload.goal?.slice(0, 40) || 'Subagent')}${progress}`;
+    }
+  } else if (type === 'chat.subagent.complete') {
+    if (el) {
+      const status = payload.status === 'completed' ? 'completed' : 'failed';
+      const icon = payload.status === 'completed' ? '✅' : '❌';
+      el.innerHTML = `${icon} ${escapeHtml(payload.goal?.slice(0, 40) || 'Subagent')} <span class="subagent-status ${status}">${escapeHtml(payload.status || '')}</span>`;
+      // Auto-remove after 5 seconds
+      setTimeout(() => el?.remove(), 5000);
+    }
+  }
+
+  // Hide panel if empty
+  if (panel && panel.children.length <= 1) {
+    panel.style.display = 'none';
+  }
+}
+
+// ── Interactive Modals ─────────────────────────────────────────────
+
+function showClarifyModal(question, choices, requestId) {
+  if (!choices || choices.length === 0) {
+    // Open-ended: text input
+    showModal({
+      title: 'Clarification Needed',
+      body: `<p>${escapeHtml(question)}</p><input type="text" id="clarify-input" class="modal-input" placeholder="Your answer..." style="width:100%;margin-top:12px;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--fg);">`,
+      confirmText: 'Submit',
+      onConfirm: () => {
+        const input = document.getElementById('clarify-input');
+        if (input) wsClient.clarifyRespond(requestId, input.value);
+      }
+    });
+  } else {
+    // Multiple choice
+    const buttons = choices.map(c =>
+      `<button class="modal-choice-btn" data-choice="${escapeHtml(c)}" style="display:block;width:100%;margin:4px 0;padding:10px;text-align:left;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;color:var(--fg);cursor:pointer;">${escapeHtml(c)}</button>`
+    ).join('');
+    showModal({
+      title: 'Clarification Needed',
+      body: `<p>${escapeHtml(question)}</p><div style="margin-top:12px;">${buttons}</div>`,
+      showCancel: false,
+      confirmText: null,
+      onRender: () => {
+        document.querySelectorAll('.modal-choice-btn').forEach(btn => {
+          btn.onclick = () => {
+            wsClient.clarifyRespond(requestId, null, btn.dataset.choice);
+            closeModal();
+          };
+        });
+      }
+    });
+  }
+}
+
+function showApprovalModal(command, description) {
+  showModal({
+    title: 'Approval Required',
+    body: `
+      <p>${escapeHtml(description || 'The agent wants to run a command:')}</p>
+      <pre style="margin-top:12px;padding:12px;background:var(--bg-dark);border-radius:8px;overflow-x:auto;"><code>${escapeHtml(command)}</code></pre>
+    `,
+    confirmText: '✅ Approve',
+    cancelText: '❌ Deny',
+    onConfirm: () => wsClient.approvalRespond(true, command),
+    onCancel: () => wsClient.approvalRespond(false, command),
+  });
+}
+
+function showSudoModal(requestId) {
+  showModal({
+    title: 'Sudo Password Required',
+    body: `<p data-i18n="auto.theAgentNeedsSudoPrivilegesEnterYourPassword">The agent needs sudo privileges. Enter your password:</p><input type="password" id="sudo-input" class="modal-input" placeholder="Password" style="width:100%;margin-top:12px;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--fg);">`,
+    confirmText: 'Submit',
+    onConfirm: () => {
+      const input = document.getElementById('sudo-input');
+      if (input) wsClient.sudoRespond(requestId, input.value);
+    }
+  });
+}
+
+function showSecretModal(envVar, prompt, requestId) {
+  showModal({
+    title: `Secret Required: ${escapeHtml(envVar)}`,
+    body: `<p>${escapeHtml(prompt || `Enter value for ${envVar}:`)}</p><input type="password" id="secret-input" class="modal-input" placeholder="Value" style="width:100%;margin-top:12px;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--fg);">`,
+    confirmText: 'Submit',
+    onConfirm: () => {
+      const input = document.getElementById('secret-input');
+      if (input) wsClient.secretRespond(requestId, input.value);
+    }
+  });
+}
+
+function ensureThinkingPanel(messagesDiv) {
+  let panel = document.getElementById('chat-thinking-panel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'chat-thinking-panel';
+    panel.className = 'chat-thinking-panel';
+    panel.innerHTML = '<div class="thinking-header" data-i18n="auto.thinking">💭 Thinking</div><div class="thinking-text"></div>';
+    // Insert before the streaming message or at the end
+    const streamEl = document.getElementById('chat-streaming');
+    // Guard: streamEl might have been removed/replaced by reloadCurrentSessionMessages
+    // between check and insert. Use contains() for safety.
+    if (streamEl && messagesDiv.contains(streamEl)) {
+      messagesDiv.insertBefore(panel, streamEl);
+    } else {
+      messagesDiv.appendChild(panel);
+    }
+  }
+  return panel;
+}
+
+function hideThinkingPanel() {
+  const panel = document.getElementById('chat-thinking-panel');
+  if (panel) panel.style.display = 'none';
+}
+
+function ensureToolCards() {
+  if (!state._wsToolCards) state._wsToolCards = new Map();
+  return state._wsToolCards;
+}
+
+function finalizeWsChat() {
+  // Guard: prevent double-call race. chat.done fires once from WS,
+  // but sendViaWebSocket also calls finalizeWsChat from onDone handler,
+  // and the finally block (sendChatMessage) also runs cleanup. Two calls
+  // cause reloadCurrentSessionMessages to race and destroy captured text.
+  if (state._finalizeInProgress) return;
+  state._finalizeInProgress = true;
+
+  state._wsToolCards = null;
+  const elapsed = ((Date.now() - (state._chatStartTime || 0)) / 1000).toFixed(1);
+  const elapsedEl = document.getElementById('chat-status-elapsed');
+  if (elapsedEl) elapsedEl.textContent = elapsed + 's';
+  const stopBtn = document.getElementById('chat-stop-btn');
+  if (stopBtn) stopBtn.style.display = 'none';
+  const sendBtn = document.getElementById('chat-send-btn');
+  if (sendBtn) { sendBtn.style.display = ''; sendBtn.disabled = false; sendBtn.textContent = t('ui.send'); }
+
+  // Reset status indicator
+  const indicator = document.getElementById('agent-status-indicator');
+  if (indicator) {
+    indicator.textContent = 'ready';
+    indicator.className = 'status-idle';
+  }
+
+  // Hide subagent panel after delay
+  setTimeout(() => {
+    const panel = document.getElementById('subagent-panel');
+    if (panel && panel.children.length <= 1) panel.style.display = 'none';
+  }, 6000);
+
+  // CAPTURE streaming text BEFORE removing streamEl.
+  // chat.done fires BEFORE Hermes finishes writing the final message to SQLite,
+  // so reloadCurrentSessionMessages() may miss the streaming content.
+  const streamEl = document.getElementById('chat-streaming');
+  let capturedText = '';
+  if (streamEl) {
+    const span = streamEl.querySelector('#gw-stream-text');
+    if (span) capturedText = span.textContent || '';
+    streamEl.remove();
+  }
+  // Also remove any orphaned thinking panel
+  const thinkEl = document.getElementById('chat-thinking-panel');
+  if (thinkEl) thinkEl.remove();
+
+  // Reload from DB for clean final render, then merge captured streaming text
+  // in case the final message hadn't been written to DB yet.
+  if (state._currentChatSession) {
+    reloadCurrentSessionMessages().then(() => {
+      // Merge captured streaming text if the DB didn't persist the response in time.
+      // chat.done fires before Hermes writes to SQLite, so two cases arise:
+      //   1. DB wrote an empty assistant entry → fill its body
+      //   2. DB hasn't written the response yet → last element is the user message → append a new assistant bubble
+      if (capturedText) {
+        const messagesDiv = document.getElementById('chat-messages');
+        if (messagesDiv) {
+          const lastAssistant = messagesDiv.querySelector('.msg-assistant:last-child');
+          const lastBody = lastAssistant?.querySelector('.msg-body');
+          if (lastAssistant && lastBody && !lastBody.textContent?.trim()) {
+            // Case 1: empty assistant entry in DB
+            lastBody.innerHTML = renderChatContent(capturedText.substring(0, 8000));
+            highlightCodeBlocks(lastBody);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+          } else if (!lastAssistant) {
+            // Case 2: response not in DB yet — show captured streaming text as a placeholder bubble
+            const div = document.createElement('div');
+            div.className = 'chat-msg msg-assistant';
+            const header = document.createElement('div');
+            header.className = 'msg-header';
+            header.innerHTML = '<span class="msg-header-label">🤖 Assistant</span>';
+            const body = document.createElement('div');
+            body.className = 'msg-body';
+            body.innerHTML = renderChatContent(capturedText.substring(0, 8000));
+            div.appendChild(header);
+            div.appendChild(body);
+            messagesDiv.appendChild(div);
+            highlightCodeBlocks(div);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+          }
+        }
+      }
+    }).finally(() => {
+      state._finalizeInProgress = false;
+    }).catch((e) => {
+      state._finalizeInProgress = false;
+      console.error('[Chat] reload error:', e);
+    });
+  } else {
+    state._finalizeInProgress = false;
+  }
+  refreshChatSidebar();
+  updateChatHeader();
+  state._chatLock = false;
+  // Play completion sound if enabled
+  playChatComplete();
+
+  // Dequeue pending messages
+  if (state._chatQueue && state._chatQueue.length > 0) {
+    const next = state._chatQueue.shift();
+    updateQueueBadge();
+    const input = document.getElementById('chat-input');
+    if (input) { input.value = next; input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 120) + 'px'; }
+    setTimeout(() => sendChatMessage(), 300);
+  }
+}
+
+function showChatError(error) {
+  const messagesDiv = document.getElementById('chat-messages');
+  if (messagesDiv) {
+    messagesDiv.innerHTML += `<div class="chat-msg msg-system"><div class="msg-body" style="color:var(--red)">❌ ${escapeHtml(error)}</div></div>`;
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  }
+  const stopBtn = document.getElementById('chat-stop-btn');
+  if (stopBtn) stopBtn.style.display = 'none';
+  const sendBtn = document.getElementById('chat-send-btn');
+  if (sendBtn) sendBtn.style.display = '';
+}
+
+function showChatWarning(msg) {
+  const messagesDiv = document.getElementById('chat-messages');
+  if (messagesDiv) {
+    messagesDiv.innerHTML += `<div class="chat-msg msg-system"><div class="msg-body" style="color:var(--amber)">⚠️ ${escapeHtml(msg)}</div></div>`;
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  }
+}
+
+// ── Send via WebSocket ──
+async function sendViaWebSocket(text, profile, sessionId) {
+  return new Promise((resolve, reject) => {
+    const messagesDiv = document.getElementById('chat-messages');
+    if (!messagesDiv) { reject(new Error('No chat container')); return; }
+
+    // User message ALREADY added by sendChatMessage() — don't add again
+    state._chatStartTime = Date.now();
+    state._wsToolCards = new Map();
+
+    // Use the streaming element created by sendChatMessage()
+    let streamEl = document.getElementById('chat-streaming');
+    if (!streamEl) {
+      // Fallback: create if missing
+      streamEl = document.createElement('div');
+      streamEl.id = 'chat-streaming';
+      streamEl.className = 'chat-msg msg-assistant';
+      streamEl.innerHTML = '<div class="msg-header"><span class="msg-header-label" data-i18n="auto.assistant">🤖 Assistant</span></div><div class="msg-body"><span id="gw-stream-text"></span></div>';
+      messagesDiv.appendChild(streamEl);
+    }
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+    // Show stop button, hide send
+    const stopBtn = document.getElementById('chat-stop-btn');
+    const sendBtn = document.getElementById('chat-send-btn');
+    if (stopBtn) stopBtn.style.display = '';
+    if (sendBtn) sendBtn.style.display = 'none';
+
+    // One-time listener for completion
+    function onDone(ev) {
+      const msg = ev.detail;
+      if (msg.type === 'chat.done') {
+        wsClient.removeEventListener('message', onDone);
+        finalizeWsChat();
+        resolve();
+      } else if (msg.type === 'chat.error') {
+        wsClient.removeEventListener('message', onDone);
+        // Recoverable — CLI fallback will handle this
+        showChatWarning(msg.error);
+        reject(new Error(msg.error));
+      }
+    }
+    wsClient.addEventListener('message', onDone);
+
+    // Send via WS
+    const ok = wsClient.chatStart({ message: text, profile, session_id: sessionId });
+    if (!ok) {
+      wsClient.removeEventListener('message', onDone);
+      reject(new Error('WebSocket not connected'));
+    }
+  });
 }
 
 // ── CLI Fallback Chat (legacy) ──
@@ -999,7 +1958,7 @@ function addToolCallCard(contentDiv, callId, name, args) {
     </div>`;
   // Insert before cursor
   const cursor = contentDiv.querySelector('.chat-cursor');
-  if (cursor) {
+  if (cursor && contentDiv.contains(cursor)) {
     contentDiv.insertBefore(card, cursor);
   } else {
     contentDiv.appendChild(card);
@@ -1023,13 +1982,23 @@ function finalizeToolCard(toolCards, callId, result) {
   el.classList.add('expanded');
   const resultEl = el.querySelector(`#tool-result-${callId}`) || el.querySelector('.tool-card-result');
   if (resultEl && result) {
-    const display = typeof result === 'string' ? result.substring(0, 500) : JSON.stringify(result).substring(0, 500);
-    resultEl.innerHTML = `<pre>${escapeHtml(display)}</pre>`;
+    const display = typeof result === 'string' ? result.substring(0, 4000) : JSON.stringify(result).substring(0, 4000);
+    const fullLen = typeof result === 'string' ? result.length : JSON.stringify(result).length;
+    if (fullLen > 4000) {
+      resultEl.innerHTML = `
+        <pre class="tool-result-truncated">${escapeHtml(display)}</pre>
+        <button class="tool-expand-btn" onclick="this.previousElementSibling.classList.toggle('tool-result-truncated'); this.previousElementSibling.classList.toggle('tool-result-full'); this.textContent = this.previousElementSibling.classList.contains('tool-result-full') ? 'Show less' : 'Show more (${(fullLen - 4000).toLocaleString()} more chars)';">Show more (${(fullLen - 4000).toLocaleString()} more chars)</button>`;
+      resultEl.classList.add('has-expand');
+    } else {
+      resultEl.innerHTML = `<pre>${escapeHtml(display)}</pre>`;
+    }
   }
 }
 
 function updateStreamContent(contentDiv, fullContent, toolCards, messagesDiv, elapsed) {
   if (!contentDiv) return;
+  // Guard: if contentDiv is no longer in the DOM (stream finalized), skip
+  if (!document.contains(contentDiv)) return;
   // Use a dedicated text span for streaming content (avoid full DOM rebuild)
   let textSpan = contentDiv.querySelector('#gw-stream-text');
   if (!textSpan) {
@@ -1037,9 +2006,9 @@ function updateStreamContent(contentDiv, fullContent, toolCards, messagesDiv, el
     textSpan.id = 'gw-stream-text';
     // Insert after any existing tool cards
     const lastCard = contentDiv.querySelector('.tool-call-card:last-of-type');
-    if (lastCard && lastCard.nextSibling) {
+    if (lastCard && contentDiv.contains(lastCard) && lastCard.nextSibling && contentDiv.contains(lastCard.nextSibling)) {
       contentDiv.insertBefore(textSpan, lastCard.nextSibling);
-    } else if (lastCard) {
+    } else if (lastCard && contentDiv.contains(lastCard)) {
       lastCard.after(textSpan);
     } else {
       contentDiv.prepend(textSpan);
@@ -1064,65 +2033,97 @@ function updateStreamContent(contentDiv, fullContent, toolCards, messagesDiv, el
 
 function renderChatContent(text) {
   if (!text) return '';
-  let html = escapeHtml(toDisplayText(text));
+  text = toDisplayText(text);
 
-  // Code blocks ```lang ... ```
-  html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (match, lang, code) => {
-    const langClass = lang ? `language-${lang}` : '';
-    const langLabel = lang ? `<span style="position:absolute;top:4px;left:10px;font-size:9px;text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-subtle);">${escapeHtml(lang)}</span>` : '';
-    return `<pre style="position:relative;">${langLabel}<button class="code-copy-btn" onclick="copyCodeBlock(this)">Copy</button><code class="${langClass}">${code.trim()}</code></pre>`;
+  // ── 1. Extract code blocks FIRST (before any escaping) ──
+  const codeBlocks = [];
+  let html = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (match, lang, code) => {
+    const id = codeBlocks.length;
+    codeBlocks.push({ lang: lang || '', code: escapeHtml(code.trimEnd()) });
+    return `\x00CODE${id}\x00`;
   });
 
-  // Inline code
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // ── 2. Escape everything outside code blocks ──
+  html = escapeHtml(html);
 
+  // ── 3. Markdown formatting (safe — text already escaped) ──
   // Bold
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-
   // Italic
   html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-  // Headers (### → h4, ## → h3, # → h2)
-  html = html.replace(/^### (.+)$/gm, '<h4 style="font-size:13px;font-weight:700;margin:10px 0 4px;color:var(--fg);">$1</h4>');
-  html = html.replace(/^## (.+)$/gm, '<h3 style="font-size:14px;font-weight:700;margin:12px 0 6px;color:var(--fg);">$1</h3>');
-  html = html.replace(/^# (.+)$/gm, '<h2 style="font-size:15px;font-weight:700;margin:14px 0 8px;color:var(--fg);">$1</h2>');
-
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Headers
+  html = html.replace(/^#### (.+)$/gm, '<h4 style="font-size:12px;font-weight:700;margin:8px 0 4px;color:var(--fg);">$1</h4>');
+  html = html.replace(/^### (.+)$/gm, '<h3 style="font-size:13px;font-weight:700;margin:10px 0 4px;color:var(--fg);">$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2 style="font-size:14px;font-weight:700;margin:12px 0 6px;color:var(--fg);">$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1 style="font-size:15px;font-weight:700;margin:14px 0 8px;color:var(--fg);">$1</h1>');
   // Blockquotes
-  html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-
-  // Unordered lists (- item)
-  html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
-  html = html.replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>');
-  // Fix nested <ul> wrapping
-  html = html.replace(/<\/ul>\s*<ul>/g, '');
-
-  // Ordered lists (1. item)
-  html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-
+  html = html.replace(/^&gt; (.+)$/gm, '<blockquote style="border-left:3px solid var(--accent);padding-left:10px;margin:6px 0;color:var(--fg-subtle);">$1</blockquote>');
   // Links [text](url)
   html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-
   // Horizontal rules
   html = html.replace(/^---$/gm, '<hr style="border:none;border-top:1px solid var(--border);margin:10px 0;">');
 
-  // Tables (basic support)
-  html = html.replace(/\|(.+)\|\n\|[-| ]+\|\n((?:\|.+\|\n?)+)/g, (match, headerRow, bodyRows) => {
-    const headers = headerRow.split('|').map(h => h.trim()).filter(Boolean);
-    const rows = bodyRows.trim().split('\n').map(row =>
-      row.split('|').map(c => c.trim()).filter(Boolean)
+  // ── 4. Restore code blocks ──
+  codeBlocks.forEach((cb, i) => {
+    const langClass = cb.lang ? `language-${cb.lang}` : '';
+    const langLabel = cb.lang ? `<span style="position:absolute;top:4px;left:10px;font-size:9px;text-transform:uppercase;letter-spacing:0.06em;color:var(--fg-subtle);">${escapeHtml(cb.lang)}</span>` : '';
+    html = html.replace(
+      `\x00CODE${i}\x00`,
+      `<pre style="position:relative;padding-top:22px;">${langLabel}<button class="code-copy-btn" onclick="copyCodeBlock(this)" data-i18n="auto.copy">Copy</button><code class="${langClass}">${cb.code}</code></pre>`
     );
-    let table = '<table><thead><tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
-    for (const row of rows) {
-      table += '<tr>' + row.map(c => `<td>${c}</td>`).join('') + '</tr>';
-    }
-    table += '</tbody></table>';
-    return table;
   });
 
-  // Line breaks (preserve double newlines as paragraph breaks)
-  html = html.replace(/\n\n/g, '</p><p>');
+  // ── 5. Lists (process after code blocks restored) ──
+  // Collect ALL list items first, then wrap adjacent ones in <ul>/<ol>
+  const listReplacements = [];
+  // Unordered: capture individual - items (non-greedy, won't eat across items)
+  html = html.replace(/^- ([\s\S]*?)$/gm, (_, content) => {
+    const id = listReplacements.length;
+    listReplacements.push({ type: 'ul', content, id });
+    return `\x00LISTITEM${id}\x00`;
+  });
+  // Ordered: capture individual 1. items
+  html = html.replace(/^\d+\. ([\s\S]*?)$/gm, (_, content) => {
+    const id = listReplacements.length;
+    listReplacements.push({ type: 'ol', content, id });
+    return `\x00LISTITEM${id}\x00`;
+  });
+  // Group consecutive same-type list items
+  const grouped = [];
+  for (const item of listReplacements) {
+    const last = grouped[grouped.length - 1];
+    if (last && last.type === item.type) {
+      last.items.push(item.content);
+    } else {
+      grouped.push({ type: item.type, items: [item.content] });
+    }
+  }
+  // Restore as <ul>/<ol>
+  grouped.forEach((g, gi) => {
+    const items = g.items.map((c, i) => `<li>${c}</li>`).join('');
+    const tag = `<${g.type}>${items}</${g.type}>`;
+    html = html.replace(`\x00LISTITEM${gi}\x00`, tag);
+  });
+  // Clean up any stray unreplaced list placeholders (shouldn't happen)
+  html = html.replace(/\x00LISTITEM\d+\x00/g, '');
+
+  // ── 6. Paragraphs ──
+  // Split on double newlines, wrap each chunk in <p>
+  const chunks = html.split(/(?:&lt;br&gt;){2,}|\n\n/).filter(Boolean);
+  if (chunks.length > 1) {
+    html = chunks.map(c => {
+      const trimmed = c.trim();
+      if (trimmed.startsWith('<pre') || trimmed.startsWith('<blockquote') || trimmed.startsWith('<h') || trimmed.startsWith('<hr') || trimmed.startsWith('<ul') || trimmed.startsWith('<li')) return c;
+      return `<p>${trimmed}</p>`;
+    }).join('');
+  } else if (!html.startsWith('<') || html.startsWith('<em>') || html.startsWith('<strong>')) {
+    html = `<p>${html}</p>`;
+  }
+
+  // Single line breaks inside paragraphs → <br>
   html = html.replace(/\n/g, '<br>');
-  if (!html.startsWith('<')) html = '<p>' + html + '</p>';
 
   return html;
 }
@@ -1133,11 +2134,11 @@ window.copyCodeBlock = function(btn) {
   const code = pre.querySelector('code');
   const text = code.textContent;
   navigator.clipboard.writeText(text).then(() => {
-    btn.textContent = 'Copied!';
-    setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    btn.textContent = t('ui.copied');
+    setTimeout(() => { btn.textContent = t('ui.copy'); }, 1500);
   }).catch(() => {
-    btn.textContent = 'Error';
-    setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    btn.textContent = t('ui.error');
+    setTimeout(() => { btn.textContent = t('ui.copy'); }, 1500);
   });
 };
 
@@ -1149,15 +2150,227 @@ function highlightCodeBlocks(container) {
   });
 }
 
-function createMessageDiv(role, content) {
+function createMessageDiv(role, content, optId) {
   const cls = { user: 'msg-user', assistant: 'msg-assistant' }[role] || 'msg-assistant';
+  // Dedup: skip if exact user message with same content was sent in last 10s
+  if (role === 'user' && isDuplicateUserMessage(content)) {
+    console.warn('[Chat] Skipping duplicate user message');
+    return document.createElement('div'); // empty, invisible
+  }
   const div = document.createElement('div');
   div.className = `chat-msg ${cls}`;
+  if (optId) div.dataset.optId = optId;
   const body = document.createElement('div');
   body.className = 'msg-body';
   body.textContent = content;
   div.appendChild(body);
   return div;
+}
+
+/** 3-layer dedup buffer */
+function addToDedupBuf(role, content) {
+  if (!state._recentMessages) state._recentMessages = { buf: [], max: 20 };
+  const b = state._recentMessages;
+  b.buf.unshift({ role, content, ts: Date.now() });
+  if (b.buf.length > b.max) b.buf.length = b.max;
+}
+
+/** Check if user message is a dupe within 10s / last 5 messages */
+function isDuplicateUserMessage(content) {
+  const b = state._recentMessages?.buf;
+  if (!b?.length) return false;
+  const win = 10000; // 10 seconds
+  const recent = b.slice(0, 5);
+  return recent.some(m => m.role === 'user' && m.content === content && Date.now() - m.ts < win);
+}
+
+/** Swap optimistic user message when server confirms session */
+function swapOptimisticMessage(sessionId) {
+  if (!state._currentChatSession && sessionId) {
+    state._currentChatSession = sessionId;
+  }
+  if (state._optMessages?.size > 0) {
+    // Clear optimistic markers once we have a real session
+    for (const [optId, entry] of state._optMessages) {
+      if (entry.el) entry.el.dataset.optId = '';
+    }
+    state._optMessages.clear();
+  }
+}
+
+/** Update chat UI connection status indicator */
+function updateWsConnectionUI(connected) {
+  // Find or create the connection indicator in chat header
+  let indicator = document.getElementById('ws-conn-indicator');
+  if (!indicator) {
+    // Create it — insert into chat-header-right area
+    const header = document.getElementById('chat-header-right');
+    if (header) {
+      indicator = document.createElement('span');
+      indicator.id = 'ws-conn-indicator';
+      indicator.title = 'WebSocket connection';
+      header.appendChild(indicator);
+    }
+  }
+  if (indicator) {
+    indicator.textContent = connected ? '🟢 ws' : '🔴 ws';
+    indicator.title = connected ? 'WebSocket connected' : 'WebSocket disconnected — reconnecting...';
+    indicator.style.cssText = 'font-size:10px;margin-left:6px;cursor:default;';
+  }
+  // Also update agent-status-indicator if it exists
+  const agentIndicator = document.getElementById('agent-status-indicator');
+  if (agentIndicator) {
+    if (!connected) {
+      agentIndicator.textContent = 'reconnecting';
+      agentIndicator.className = 'status-busy';
+    }
+  }
+}
+
+/** Phase 3: Update gateway health badge in chat header */
+async function updateGatewayBadge() {
+  const badge = document.getElementById('chat-gateway-badge');
+  if (!badge) return;
+  const profile = document.getElementById('chat-profile')?.value || 'default';
+  try {
+    const res = await fetch(`/api/gateway/${encodeURIComponent(profile)}/health`);
+    if (!res.ok) throw new Error('not ok');
+    const data = await res.json();
+    if (data.healthy && data.port) {
+      badge.textContent = `🌐 ${data.port}`;
+      badge.className = 'chat-header-badge badge-healthy';
+      badge.title = `Gateway healthy — mode: ${data.gatewayMode}`;
+    } else {
+      badge.textContent = '⚠️ DOWN';
+      badge.className = 'chat-header-badge badge-down';
+      badge.title = (data.issues || []).join('; ');
+    }
+  } catch {
+    badge.textContent = '⚠️ ERR';
+    badge.className = 'chat-header-badge badge-down';
+    badge.title = 'Gateway health check failed';
+  }
+}
+
+/** Phase 3: Fork session from a specific message index */
+async function forkFromMessage(msgIndex) {
+  const sid = state._currentChatSession;
+  if (!sid) return;
+  const profile = document.getElementById('chat-profile')?.value || 'default';
+  try {
+    const res = await fetch(`/api/chat/fork?profile=${encodeURIComponent(profile)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-csrf-token': state.csrfToken || '' },
+      credentials: 'include',
+      body: JSON.stringify({ sessionId: sid, messageIndex: msgIndex }),
+    });
+    const data = await res.json();
+    if (data.ok && data.newSessionId) {
+      await refreshChatSidebar();
+      await loadChatSession(data.newSessionId);
+    } else {
+      console.warn('[Fork] failed:', data.error);
+    }
+  } catch (e) {
+    console.warn('[Fork] error:', e);
+  }
+}
+
+/** Play a subtle completion sound when a chat response finishes */
+function playChatComplete() {
+  if (!state._soundEnabled) return;
+  if (!state._soundEl) {
+    try {
+      state._soundEl = new (window.AudioContext || window.webkitAudioContext)();
+      state._soundReady = true;
+    } catch (e) {
+      console.warn('[Chat] AudioContext not available:', e);
+      return;
+    }
+  }
+  try {
+    const src = state._soundEl.createBufferSource();
+    src.buffer = state._soundEl.createBuffer(1, state._soundEl.sampleRate * 0.12, state._soundEl.sampleRate);
+    const data = src.buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) {
+      const t = i / state._soundEl.sampleRate;
+      const freq1 = 523, freq2 = 1047, beepDur = 0.06;
+      const fade = Math.min(i, data.length - i) / (state._soundEl.sampleRate * 0.015);
+      data[i] = (t < beepDur ? Math.sin(2 * Math.PI * freq1 * t) :
+                t < beepDur * 2 ? 0 : Math.sin(2 * Math.PI * freq2 * (t - beepDur * 2)) * 0.6) * 0.2 * fade;
+    }
+    const gain = state._soundEl.createGain();
+    gain.gain.value = 0.4;
+    src.connect(gain);
+    gain.connect(state._soundEl.destination);
+    src.start();
+  } catch (e) {
+    console.warn('[Chat] Failed to play completion sound:', e);
+  }
+}
+
+/** Toggle chat sound notifications */
+function toggleChatSound() {
+  state._soundEnabled = !state._soundEnabled;
+  const btn = document.getElementById('chat-sound-btn');
+  if (btn) btn.textContent = state._soundEnabled ? '🔔' : '🔕';
+  if (state._soundEnabled && !state._soundEl) {
+    try {
+      state._soundEl = new (window.AudioContext || window.webkitAudioContext)();
+      state._soundReady = true;
+    } catch (e) { /* AudioContext blocked until user gesture */ }
+  }
+  return state._soundEnabled;
+}
+
+/** Update live "running tools" count indicator in chat header */
+function updateToolCountUI() {
+  const count = state._wsToolCount || 0;
+  let indicator = document.getElementById('tool-count-indicator');
+  if (!indicator) {
+    const header = document.getElementById('chat-header-right');
+    if (header) {
+      indicator = document.createElement('span');
+      indicator.id = 'tool-count-indicator';
+      header.appendChild(indicator);
+    }
+  }
+  if (indicator) {
+    if (count > 0) {
+      indicator.textContent = `🔨 ${count} tool${count > 1 ? 's' : ''} running`;
+      indicator.style.cssText = 'font-size:10px;margin-left:6px;color:var(--gold);cursor:default;';
+    } else {
+      indicator.textContent = '';
+    }
+  }
+}
+
+/** Render an artifact card from the gateway */
+function handleArtifact(artifact) {
+  if (!artifact) return;
+  const messagesDiv = document.getElementById('chat-messages');
+  if (!messagesDiv) return;
+  const type = artifact.type || 'file';
+  const name = artifact.name || 'artifact';
+  const description = artifact.description || '';
+  const content = artifact.content || '';
+  const language = artifact.language || '';
+
+  const card = document.createElement('div');
+  card.className = 'artifact-card';
+  card.innerHTML = `
+    <div class="artifact-header" onclick="this.parentElement.classList.toggle('expanded')">
+      <span class="artifact-icon">${type === 'code' ? '💻' : type === 'image' ? '🖼️' : type === 'text' ? '📄' : '📦'}</span>
+      <span class="artifact-name">${escapeHtml(name)}</span>
+      ${description ? `<span class="artifact-desc">${escapeHtml(description)}</span>` : ''}
+      <span class="artifact-chevron">▶</span>
+    </div>
+    <div class="artifact-body">
+      ${content ? `<pre class="artifact-content ${language ? 'language-' + escapeHtml(language) : ''}">${escapeHtml(content.substring(0, 8000))}</pre>` : '<div class="artifact-empty" data-i18n="auto.noContent">No content</div>'}
+    </div>`;
+  messagesDiv.appendChild(card);
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  state._artifactCount = (state._artifactCount || 0) + 1;
 }
 
 // ============================================
@@ -1167,56 +2380,41 @@ async function loadHome(container) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">Home</div>
-        <div class="page-subtitle">System overview</div>
+        <div class="page-title" data-i18n="home.title">Home</div>
+        <div class="page-subtitle" data-i18n="home.subtitle">System overview</div>
       </div>
       <div style="display:flex;gap:8px;">
-        <button class="btn btn-primary" onclick="openTerminalPanel('Hermes CLI', '')">⌘ Terminal</button>
-        <button class="btn btn-ghost" onclick="loadHome(document.querySelector('.page.active'))">↻ Refresh</button>
+        <button class="btn btn-primary" onclick="openTerminalPanel('Hermes CLI', '')" data-i18n="home.terminal">⌘ Terminal</button>
+        <button class="btn btn-ghost" onclick="loadHome(document.querySelector('.page.active'))" data-i18n="home.refresh">↻ Refresh</button>
       </div>
     </div>
-    <div class="card-grid" id="home-cards">
-      <div class="card"><div class="card-title">System Health</div><div class="loading">Loading</div></div>
-      <div class="card"><div class="card-title">Agent Overview</div><div class="loading">Loading</div></div>
-    </div>
-    <div class="card-grid" id="home-bottom" style="margin-top:16px;">
-      <div class="card" id="home-gateways"><div class="card-title">Gateways</div><div class="loading">Loading</div></div>
-      <div class="card">
-        <div class="card-title">Hermes Auth</div>
-        <div id="home-auth-list"><div class="loading">Loading auth...</div></div>
-      </div>
+    <div class="card-grid" id="home-cards" style="grid-template-columns:repeat(4,1fr);">
+      <div class="card" id="home-agent"><div class="card-title" data-i18n="home.agentOverview">Agent Overview</div><div class="loading" data-i18n="common.loading">Loading</div></div>
+      <div class="card" id="home-gateways"><div class="card-title" data-i18n="home.gateways">Gateways</div><div class="loading" data-i18n="common.loading">Loading</div></div>
+      <div class="card"><div class="card-title" data-i18n="home.hermesAuth">Hermes Auth</div><div id="home-auth-list"><div class="loading" data-i18n="home.loadingAuth">Loading auth...</div></div></div>
+      <div class="card" id="home-setup"><div class="card-title" data-i18n="home.setupHealth">Setup Health</div><div class="loading" data-i18n="home.checking">Checking...</div></div>
     </div>
   `;
 
   try {
-    const [healthRes, profilesRes, agentRes, cronRes] = await Promise.all([
-      api('/api/system/health'),
+    const [profilesRes, agentRes, cronRes] = await Promise.all([
       api('/api/profiles'),
       api('/api/agent/status'),
       api('/api/cron/list', { method: 'POST', body: '{}' }),
     ]);
 
-    // Row 1: System Health + Agent Overview (merged)
-    const cardsEl = document.getElementById('home-cards');
-    if (healthRes.ok) {
-      cardsEl.innerHTML = `
-        <div class="card">
-          <div class="card-title">System Health</div>
-          <div class="stat-row"><span class="stat-label">CPU</span><span class="stat-value">${healthRes.cpu || 'N/A'}</span></div>
-          <div class="stat-row"><span class="stat-label">RAM</span><span class="stat-value">${healthRes.ram || 'N/A'}</span></div>
-          <div class="stat-row"><span class="stat-label">Disk</span><span class="stat-value">${healthRes.disk || 'N/A'}</span></div>
-          <div class="stat-row"><span class="stat-label">Uptime</span><span class="stat-value">${healthRes.uptime || 'N/A'}</span></div>
-        </div>
-        <div class="card">
-          <div class="card-title">Agent Overview</div>
-          <div class="stat-row"><span class="stat-label">Model</span><span class="stat-value">${agentRes.ok ? (agentRes.model || 'N/A') : 'N/A'}</span></div>
-          <div class="stat-row"><span class="stat-label">Provider</span><span class="stat-value">${agentRes.ok ? (agentRes.provider || 'N/A') : 'N/A'}</span></div>
-          <div class="stat-row"><span class="stat-label">Gateway</span><span class="stat-value ${agentRes.ok && agentRes.gatewayStatus?.includes('running') ? 'status-ok' : 'status-off'}">${agentRes.ok ? (agentRes.gatewayStatus || 'N/A') : 'N/A'}</span></div>
-          <div class="stat-row"><span class="stat-label">API Keys</span><span class="stat-value">${agentRes.ok ? `${agentRes.apiKeys?.active || 0}/${agentRes.apiKeys?.total || 0} active` : 'N/A'}</span></div>
-          <div class="stat-row"><span class="stat-label">Platforms</span><span class="stat-value">${agentRes.ok ? (agentRes.platforms?.filter(p => p.configured).map(p => p.name).join(', ') || 'None') : 'N/A'}</span></div>
-          <div class="stat-row"><span class="stat-label">Cron</span><span class="stat-value">${cronRes?.jobs?.length || 0} jobs</span></div>
-          <div class="stat-row"><span class="stat-label">Sessions</span><span class="stat-value">${agentRes.ok ? `${agentRes.activeSessions || 0} active` : 'N/A'}</span></div>
-        </div>
+    // Row 1: Agent Overview only (System Health/Details moved to Monitor page)
+    const agentCard = document.getElementById('home-agent');
+    if (agentCard) {
+      agentCard.innerHTML = `
+        <div class="card-title" data-i18n="home.agentOverview">Agent Overview</div>
+        <div class="stat-row"><span class="stat-label" data-i18n="home.model">Model</span><span class="stat-value">${agentRes.ok ? (agentRes.model || 'N/A') : 'N/A'}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="home.provider">Provider</span><span class="stat-value">${agentRes.ok ? (agentRes.provider || 'N/A') : 'N/A'}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="home.gateway">Gateway</span><span class="stat-value ${agentRes.ok && agentRes.gatewayStatus?.includes('running') ? 'status-ok' : 'status-off'}">${agentRes.ok ? (agentRes.gatewayStatus || 'N/A') : 'N/A'}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="home.apiKeys">API Keys</span><span class="stat-value">${agentRes.ok ? `${agentRes.apiKeys?.active || 0}/${agentRes.apiKeys?.total || 0} active` : 'N/A'}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="home.platforms">Platforms</span><span class="stat-value">${agentRes.ok ? (agentRes.platforms?.filter(p => p.configured).map(p => p.name).join(', ') || 'None') : 'N/A'}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="home.cron">Cron</span><span class="stat-value">${cronRes?.jobs?.length || 0} jobs</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="home.sessions">Sessions</span><span class="stat-value">${agentRes.ok ? `${agentRes.activeSessions || 0} active` : 'N/A'}</span></div>
       `;
     }
 
@@ -1229,34 +2427,58 @@ async function loadHome(container) {
     }).join('');
     const gwCard = document.getElementById('home-gateways');
     if (gwCard) {
-      gwCard.innerHTML = `<div class="card-title">Gateways</div>${gwHtml || '<div class="stat-row"><span class="stat-label">No profiles</span></div>'}`;
+      gwCard.innerHTML = `<div class="card-title" data-i18n="home.gateways">Gateways</div>${gwHtml || '<div class="stat-row"><span class="stat-label" data-i18n="home.noProfiles">No profiles</span></div>'}`;
     }
 
     // Load auth into home
     loadHomeAuth();
 
+    // Load setup health
+    try {
+      const checkRes = await fetch('/api/setup/check');
+      if (checkRes.ok) {
+        const checkData = await checkRes.json();
+        const allOk = checkData.checks.every(c => c.ok);
+        const items = checkData.checks.map(c =>
+          `<div style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:12px;">
+            <span style="color:${c.ok ? 'var(--green)' : 'var(--red)'};">${c.ok ? '✅' : '❌'}</span>
+            <span>${escapeHtml(c.label)}</span>
+            <span style="color:var(--fg-muted);font-size:11px;margin-left:auto;">${escapeHtml(c.detail || '')}</span>
+          </div>`
+        ).join('');
+        const setupCard = document.getElementById('home-setup');
+        if (setupCard) {
+          setupCard.innerHTML = `<div class="card-title" data-i18n="home.setupHealth">Setup Health</div>${items}`;
+        }
+      }
+    } catch (e) {
+      const setupCard = document.getElementById('home-setup');
+      if (setupCard) setupCard.innerHTML = `<div class="card-title" data-i18n="home.setupHealth">Setup Health</div><div class="error-msg">${escapeHtml(e.message)}</div>`;
+    }
+
   } catch (e) {
-    document.getElementById('home-cards').innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    const agentCard = document.getElementById('home-agent');
+    if (agentCard) agentCard.innerHTML = `<div class="card-title" data-i18n="common.error">Error</div><div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
 async function hcirestart() {
-  if (!await customConfirm('Restart HCI? This will take ~2 seconds.', 'Restart')) return;
+  if (!await customConfirm(t('dialog.confirmRestartHci'), 'Restart')) return;
   try {
     const csrfToken = state.csrfToken || '';
     const res = await api('/api/hci-restart', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
     if (res.ok) {
-      showToast('HCI restarting...', 'success');
+      showToast(t('toast.hciRestarting'), 'success');
       // Wait 5s for server to come back up before reload (avoids 502)
       setTimeout(() => location.reload(), 5000);
     } else {
       showToast(res.error || 'Restart failed', 'error');
     }
-  } catch (e) { showToast('Restart failed: ' + e.message, 'error'); }
+  } catch (e) { showToast(t('toast.restartFailedPrefix') + e.message, 'error'); }
 }
 
 async function hciupdate() {
-  if (!await customConfirm('Update HCI? This will git pull, npm install, and rebuild (~30s).', 'Update')) return;
+  if (!await customConfirm(t('dialog.confirmUpdateHci'), 'Update')) return;
   await sseProgressModal('⬆ Updating HCI', '/api/hci/update', {
     headers: { 'X-CSRF-Token': state.csrfToken || '' },
     autoCloseMs: 2000,
@@ -1269,7 +2491,7 @@ function closeModal() {
 }
 
 async function runHCIUpdate() {
-  if (!await customConfirm('Update HCI? This will git pull, npm install, and rebuild (~30s).', 'Update')) return;
+  if (!await customConfirm(t('dialog.confirmUpdateHci'), 'Update')) return;
   await sseProgressModal('⬆ Updating HCI', '/api/hci/update', {
     headers: { 'X-CSRF-Token': state.csrfToken || '' },
     autoCloseMs: 2000,
@@ -1319,8 +2541,8 @@ function showCommitListModal(data) {
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
         <code class="commit-hash">${c.shortHash}</code>
         <span style="flex:1;font-weight:600;font-size:13px;">${escapeHtml(c.msg)}</span>
-        <button class="btn btn-xs btn-outline" onclick="showCommitDiff('${c.shortHash}')">Diff</button>
-        <button class="btn btn-xs btn-primary" onclick="checkoutCommit('${c.shortHash}')">Checkout</button>
+        <button class="btn btn-xs btn-outline" onclick="showCommitDiff('${c.shortHash}')" data-i18n="auto.diff">Diff</button>
+        <button class="btn btn-xs btn-primary" onclick="checkoutCommit('${c.shortHash}')" data-i18n="auto.checkout">Checkout</button>
       </div>
       <div style="font-size:11px;color:var(--fg-muted);">
         ${escapeHtml(c.author)} · ${formatRelativeTime(c.date)}
@@ -1332,7 +2554,7 @@ function showCommitListModal(data) {
     title: `${data.behind} commit(s) behind on ${data.branch}`,
     message: `<div class="commit-list-container">${commitsHtml}</div>
       <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
-        <button class="btn btn-primary" onclick="runHCIUpdate(); closeModal();">Update All (pull latest)</button>
+        <button class="btn btn-primary" onclick="runHCIUpdate(); closeModal();" data-i18n="auto.updateAllPullLatest">Update All (pull latest)</button>
       </div>`,
     buttons: [{ text: 'Close', value: false }],
   });
@@ -1360,7 +2582,7 @@ async function showCommitDiff(hash) {
 async function checkoutCommit(hash) {
   const confirmed = await showModal({
     title: 'Checkout Commit',
-    message: `Checkout to <code>${hash}</code>? This will run npm install and rebuild.<br><br><strong>The server will restart.</strong>`,
+    message: `Checkout to <code>${hash}</code>? This will run npm install and rebuild.<br><br><strong data-i18n="auto.theServerWillRestart">The server will restart.</strong>`,
     buttons: [
       { text: 'Cancel', value: false },
       { text: 'Checkout', value: true, primary: true },
@@ -1377,7 +2599,7 @@ async function runUpdateStream(endpoint) {
   overlay.className = 'modal-overlay';
   overlay.id = 'hci-update-progress';
   overlay.innerHTML = `<div class="modal-card" style="max-width:600px;">
-    <div class="modal-header"><h3>HCI Update</h3>
+    <div class="modal-header"><h3 data-i18n="auto.hciUpdate">HCI Update</h3>
       <button class="btn btn-xs btn-ghost" onclick="this.closest('.modal-overlay').remove()">✕</button>
     </div>
     <div class="modal-body">
@@ -1433,7 +2655,7 @@ async function runUpdateStream(endpoint) {
 }
 
 async function hcidoctor() {
-  if (!await customConfirm('Run diagnostics? This will check all Hermes components.', 'Diagnostics')) return;
+  if (!await customConfirm(t('dialog.confirmDiagnostics'), 'Diagnostics')) return;
   await sseProgressModal('🩺 Running Diagnostics', '/api/doctor', {
     method: 'POST',
     headers: { 'X-CSRF-Token': state.csrfToken || '' },
@@ -1454,11 +2676,11 @@ async function loadHomeAuth() {
         </div>
       `).join('');
     } else {
-      el.innerHTML = '<div class="stat-row"><span class="stat-label">Auth info unavailable</span></div>';
+      el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.authInfoUnavailable">Auth info unavailable</span></div>';
     }
   } catch {
     const el = document.getElementById('home-auth-list');
-    if (el) el.innerHTML = '<div class="stat-row"><span class="stat-label">Auth info unavailable</span></div>';
+    if (el) el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.authInfoUnavailable">Auth info unavailable</span></div>';
   }
 }
 
@@ -1470,15 +2692,15 @@ async function loadTokenUsage(elementId, days = 7) {
     if (res.ok) {
       const d = res;
       el.innerHTML = `
-        <div class="stat-row"><span class="stat-label">Sessions</span><span class="stat-value">${d.sessions}</span></div>
-        <div class="stat-row"><span class="stat-label">Messages</span><span class="stat-value">${d.messages?.toLocaleString() || 0}</span></div>
-        <div class="stat-row"><span class="stat-label">Input tokens</span><span class="stat-value">${formatNumber(d.inputTokens)}</span></div>
-        <div class="stat-row"><span class="stat-label">Output tokens</span><span class="stat-value">${formatNumber(d.outputTokens)}</span></div>
-        <div class="stat-row"><span class="stat-label">Total tokens</span><span class="stat-value">${formatNumber(d.totalTokens)}</span></div>
-        <div class="stat-row"><span class="stat-label">Est. cost</span><span class="stat-value">${d.cost || '$0.00'}</span></div>
-        <div class="stat-row"><span class="stat-label">Active time</span><span class="stat-value">${d.activeTime || '—'}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="home.sessions">Sessions</span><span class="stat-value">${d.sessions}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.messages">Messages</span><span class="stat-value">${d.messages?.toLocaleString() || 0}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.inputTokens2">Input tokens</span><span class="stat-value">${formatNumber(d.inputTokens)}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.outputTokens2">Output tokens</span><span class="stat-value">${formatNumber(d.outputTokens)}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.totalTokens2">Total tokens</span><span class="stat-value">${formatNumber(d.totalTokens)}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.estCost2">Est. cost</span><span class="stat-value">${d.cost || '$0.00'}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.activeTime2">Active time</span><span class="stat-value">${d.activeTime || '—'}</span></div>
         ${d.models && d.models.length > 0 ? `
-          <div style="margin-top:8px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;">Models</div>
+          <div style="margin-top:8px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;" data-i18n="auto.models">Models</div>
           ${d.models.slice(0, 3).map(m => `
             <div class="stat-row">
               <span class="stat-label">${m.name}</span>
@@ -1487,7 +2709,7 @@ async function loadTokenUsage(elementId, days = 7) {
           `).join('')}
         ` : ''}
         ${d.platforms && d.platforms.length > 0 ? `
-          <div style="margin-top:8px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;">Platforms</div>
+          <div style="margin-top:8px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;" data-i18n="home.platforms">Platforms</div>
           ${d.platforms.slice(0, 4).map(p => `
             <div class="stat-row">
               <span class="stat-label">${p.name}</span>
@@ -1496,7 +2718,7 @@ async function loadTokenUsage(elementId, days = 7) {
           `).join('')}
         ` : ''}
         ${d.topTools && d.topTools.length > 0 ? `
-          <div style="margin-top:8px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;">Top Tools</div>
+          <div style="margin-top:8px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;letter-spacing:0.06em;" data-i18n="auto.topTools">Top Tools</div>
           ${d.topTools.slice(0, 3).map(t => `
             <div class="stat-row">
               <span class="stat-label">${t.name}</span>
@@ -1506,10 +2728,10 @@ async function loadTokenUsage(elementId, days = 7) {
         ` : ''}
       `;
     } else {
-      el.innerHTML = '<div class="stat-row"><span class="stat-label">No data</span></div>';
+      el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.noData">No data</span></div>';
     }
   } catch {
-    el.innerHTML = '<div class="stat-row"><span class="stat-label">Unavailable</span></div>';
+    el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.unavailable">Unavailable</span></div>';
   }
 }
 
@@ -1525,16 +2747,16 @@ async function loadAgents(container) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">Agents</div>
-        <div class="page-subtitle">Manage your Hermes profiles</div>
+        <div class="page-title" data-i18n="auto.agents">Agents</div>
+        <div class="page-subtitle" data-i18n="auto.manageYourHermesProfiles">Manage your Hermes profiles</div>
       </div>
       <div style="display:flex;gap:8px;">
-        <button class="btn btn-primary" onclick="showCreateAgent()">+ Create Agent</button>
-        <button class="btn btn-ghost" onclick="loadAgents(document.querySelector('.page.active'))">↻ Refresh</button>
+        <button class="btn btn-primary" onclick="showCreateAgent()" data-i18n="auto.createAgent">+ Create Agent</button>
+        <button class="btn btn-ghost" onclick="loadAgents(document.querySelector('.page.active'))" data-i18n="home.refresh">↻ Refresh</button>
       </div>
     </div>
     <div class="card-grid" id="agents-grid">
-      <div class="loading">Loading agents</div>
+      <div class="loading" data-i18n="auto.loadingAgents">Loading agents</div>
     </div>
   `;
 
@@ -1549,22 +2771,22 @@ async function loadAgents(container) {
         return `
           <div class="card agent-card" data-profile="${p.name}">
             <div class="card-title">${p.name} ${p.active ? '<span class="badge">default</span>' : ''}</div>
-            <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value ${statusClass}">${statusText}</span></div>
-            <div class="stat-row"><span class="stat-label">Model</span><span class="stat-value">${p.model || '—'}</span></div>
-            ${p.alias ? `<div class="stat-row"><span class="stat-label">Alias</span><span class="stat-value">${p.alias}</span></div>` : ''}
+            <div class="stat-row"><span class="stat-label" data-i18n="auto.status">Status</span><span class="stat-value ${statusClass}">${statusText}</span></div>
+            <div class="stat-row"><span class="stat-label" data-i18n="home.model">Model</span><span class="stat-value">${p.model || '—'}</span></div>
+            ${p.alias ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.alias">Alias</span><span class="stat-value">${p.alias}</span></div>` : ''}
             <div class="card-actions">
-              <button class="btn btn-ghost btn-sm" onclick="navigate('agent-detail', {name:'${p.name}'})">Open</button>
-              ${!p.active ? `<button class="btn btn-ghost btn-sm" onclick="setAgentDefault('${p.name}')">Set Default</button>` : ''}
-              ${p.name !== 'default' ? `<button class="btn btn-ghost btn-sm btn-danger" onclick="deleteAgent('${p.name}')">Delete</button>` : ''}
+              <button class="btn btn-ghost btn-sm" onclick="navigate('agent-detail', {name:'${p.name}'})" data-i18n="auto.open">Open</button>
+              ${!p.active ? `<button class="btn btn-ghost btn-sm" onclick="setAgentDefault('${p.name}')" data-i18n="auto.setDefault">Set Default</button>` : ''}
+              ${p.name !== 'default' ? `<button class="btn btn-ghost btn-sm btn-danger" onclick="deleteAgent('${p.name}')" data-i18n="auto.delete">Delete</button>` : ''}
             </div>
           </div>
         `;
       }).join('');
     } else {
-      grid.innerHTML = '<div class="card"><div class="card-title">No agents found</div><div class="stat-row"><span class="stat-label">Create your first agent profile to get started.</span></div></div>';
+      grid.innerHTML = '<div class="card"><div class="card-title" data-i18n="auto.noAgentsFound">No agents found</div><div class="stat-row"><span class="stat-label" data-i18n="auto.createYourFirstAgentProfileToGetStarted">Create your first agent profile to get started.</span></div></div>';
     }
   } catch (e) {
-    document.getElementById('agents-grid').innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    document.getElementById('agents-grid').innerHTML = `<div class="card"><div class="card-title" data-i18n="common.error">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -1610,25 +2832,25 @@ async function loadAgentDetail(container, params) {
     <div class="page-header">
       <div>
         <div class="page-title">Agent: ${name}</div>
-        <div class="page-subtitle">Agent detail</div>
+        <div class="page-subtitle" data-i18n="auto.agentDetail">Agent detail</div>
       </div>
       <div style="display:flex;gap:8px;">
-        <button class="btn btn-ghost" onclick="openTerminalPanel('Setup ${name}', 'hermes -p ${name} setup')">⚙ Setup</button>
-        <button class="btn btn-primary" onclick="openTerminalPanel('Terminal ${name}', 'hermes -p ${name}')">⌘ Terminal</button>
-        <button class="btn btn-ghost" onclick="navigate('agents')">← Back</button>
+        <button class="btn btn-ghost" onclick="openTerminalPanel('Setup ${name}', 'hermes -p ${name} setup')" data-i18n="auto.setup">⚙ Setup</button>
+        <button class="btn btn-primary" onclick="openTerminalPanel('Terminal ${name}', '${name} --tui')" data-i18n="home.terminal">⌘ Terminal</button>
+        <button class="btn btn-ghost" onclick="navigate('agents')" data-i18n="auto.back">← Back</button>
       </div>
     </div>
     <div class="tabs" id="agent-tabs">
-      <button class="tab active" data-tab="dashboard">Dashboard</button>
-      <button class="tab" data-tab="sessions">Sessions</button>
-      <button class="tab" data-tab="gateway">Gateway</button>
-      <button class="tab" data-tab="config">Config</button>
-      <button class="tab" data-tab="memory">Memory</button>
-      <button class="tab" data-tab="skills">Skills</button>
-      <button class="tab" data-tab="cron">Cron</button>
+      <button class="tab active" data-tab="dashboard" data-i18n="auto.dashboard">Dashboard</button>
+      <button class="tab" data-tab="sessions" data-i18n="home.sessions">Sessions</button>
+      <button class="tab" data-tab="gateway" data-i18n="home.gateway">Gateway</button>
+      <button class="tab" data-tab="config" data-i18n="auto.config">Config</button>
+      <button class="tab" data-tab="memory" data-i18n="auto.memory">Memory</button>
+      <button class="tab" data-tab="skills" data-i18n="auto.skills">Skills</button>
+      <button class="tab" data-tab="cron" data-i18n="home.cron">Cron</button>
     </div>
     <div id="agent-tab-content">
-      <div class="loading">Loading</div>
+      <div class="loading" data-i18n="common.loading">Loading</div>
     </div>
   `;
 
@@ -1647,7 +2869,7 @@ async function loadAgentDetail(container, params) {
 
 async function loadAgentTab(tabName, profileName) {
   const content = document.getElementById('agent-tab-content');
-  content.innerHTML = '<div class="loading">Loading</div>';
+  content.innerHTML = '<div class="loading" data-i18n="common.loading">Loading</div>';
 
   switch (tabName) {
     case 'dashboard': await loadAgentDashboard(content, profileName); break;
@@ -1657,12 +2879,12 @@ async function loadAgentTab(tabName, profileName) {
     case 'memory': await loadAgentMemory(content, profileName); break;
     case 'skills': await loadAgentSkills(content, profileName); break;
     case 'cron': await loadAgentCron(content, profileName); break;
-    default: content.innerHTML = '<div class="empty">Unknown tab</div>';
+    default: content.innerHTML = '<div class="empty" data-i18n="auto.unknownTab">Unknown tab</div>';
   }
 }
 
 async function loadAgentDashboard(container, name) {
-  container.innerHTML = '<div class="loading">Loading dashboard</div>';
+  container.innerHTML = '<div class="loading" data-i18n="auto.loadingDashboard">Loading dashboard</div>';
 
   try {
     const [gatewayRes, profilesRes] = await Promise.all([
@@ -1676,28 +2898,28 @@ async function loadAgentDashboard(container, name) {
     container.innerHTML = `
       <div class="card-grid">
         <div class="card">
-          <div class="card-title">Identity</div>
-          <div class="stat-row"><span class="stat-label">Profile</span><span class="stat-value">${name}</span></div>
-          <div class="stat-row"><span class="stat-label">Model</span><span class="stat-value">${profile?.model || '—'}</span></div>
-          <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value ${gatewayOk && gatewayRes.active ? 'status-ok' : 'status-off'}">${gatewayOk && gatewayRes.active ? '● Active' : '○ Inactive'}</span></div>
-          ${profile?.alias ? `<div class="stat-row"><span class="stat-label">Alias</span><span class="stat-value">${profile.alias}</span></div>` : ''}
-          ${profile?.active ? `<div class="stat-row"><span class="stat-label">Default</span><span class="stat-value status-ok">Yes</span></div>` : ''}
+          <div class="card-title" data-i18n="auto.identity">Identity</div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.profile">Profile</span><span class="stat-value">${name}</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="home.model">Model</span><span class="stat-value">${profile?.model || '—'}</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.status">Status</span><span class="stat-value ${gatewayOk && gatewayRes.active ? 'status-ok' : 'status-off'}">${gatewayOk && gatewayRes.active ? '● Active' : '○ Inactive'}</span></div>
+          ${profile?.alias ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.alias">Alias</span><span class="stat-value">${profile.alias}</span></div>` : ''}
+          ${profile?.active ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.default">Default</span><span class="stat-value status-ok" data-i18n="auto.yes">Yes</span></div>` : ''}
         </div>
         <div class="card">
-          <div class="card-title">Gateway</div>
-          <div class="stat-row"><span class="stat-label">Service</span><span class="stat-value">${gatewayRes.service || '—'}</span></div>
-          <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value ${gatewayOk && gatewayRes.active ? 'status-ok' : 'status-off'}">${gatewayOk && gatewayRes.active ? '● Running' : '○ Stopped'}</span></div>
-          <div class="stat-row"><span class="stat-label">Enabled</span><span class="stat-value">${gatewayRes.enabled ? 'Yes' : 'No'}</span></div>
+          <div class="card-title" data-i18n="home.gateway">Gateway</div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.service">Service</span><span class="stat-value">${gatewayRes.service || '—'}</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.status">Status</span><span class="stat-value ${gatewayOk && gatewayRes.active ? 'status-ok' : 'status-off'}">${gatewayOk && gatewayRes.active ? '● Running' : '○ Stopped'}</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.enabled">Enabled</span><span class="stat-value">${gatewayRes.enabled ? 'Yes' : 'No'}</span></div>
         </div>
         <div class="card">
-          <div class="card-title">Token Usage (today)</div>
-          <div id="agent-token-${name}"><div class="loading">Loading...</div></div>
+          <div class="card-title" data-i18n="auto.tokenUsageToday">Token Usage (today)</div>
+          <div id="agent-token-${name}"><div class="loading" data-i18n="auto.loading">Loading...</div></div>
         </div>
       </div>
     `;
     loadTokenUsage(`agent-token-${name}`, 1);
   } catch (e) {
-    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    container.innerHTML = `<div class="card"><div class="card-title" data-i18n="common.error">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -1739,31 +2961,31 @@ window.loadAgentSkills = async function(container, name) {
             ${s.trust ? `<span class="badge" style="font-size:10px;opacity:0.7;">${escapeHtml(s.trust)}</span>` : ''}
           </div>
           <div style="margin-top:10px;display:flex;gap:6px;">
-            <button class="btn btn-ghost btn-sm" onclick="window.updateSkill('${escapeHtml(s.name)}','${escapeHtml(name)}')">🔄 Update</button>
-            <button class="btn btn-danger btn-sm" onclick="window.uninstallSkill('${escapeHtml(s.name)}','${escapeHtml(name)}')">🗑️ Uninstall</button>
+            <button class="btn btn-ghost btn-sm" onclick="window.updateSkill('${escapeHtml(s.name)}','${escapeHtml(name)}')" data-i18n="auto.update">🔄 Update</button>
+            <button class="btn btn-danger btn-sm" onclick="window.uninstallSkill('${escapeHtml(s.name)}','${escapeHtml(name)}')" data-i18n="auto.uninstall">🗑️ Uninstall</button>
           </div>
         </div>
       `).join('') + '</div>';
     } else {
-      skillsHtml = `<div class="card"><div class="card-title">No skills installed</div><div style="margin-top:8px;"><a href="#" onclick="window.loadSkills(document.querySelector('.page.active'));return false;" style="color:var(--accent);">Browse Skills Hub →</a></div></div>`;
+      skillsHtml = `<div class="card"><div class="card-title" data-i18n="auto.noSkillsInstalled">No skills installed</div><div style="margin-top:8px;"><a href="#" onclick="window.loadSkills(document.querySelector('.page.active'));return false;" style="color:var(--accent);" data-i18n="auto.browseSkillsHub">Browse Skills Hub →</a></div></div>`;
     }
 
     container.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
         <div style="font-size:14px;color:var(--fg-muted);">${skills.length} skill(s) installed</div>
         <div style="display:flex;gap:8px;">
-          <button class="btn btn-ghost btn-sm" onclick="window.checkSkillUpdates('${escapeHtml(name)}')">🔍 Check Updates</button>
-          <button class="btn btn-ghost btn-sm" onclick="window.loadAgentSkills(document.getElementById('agent-tab-content'), '${escapeHtml(name)}')">↻ Refresh</button>
+          <button class="btn btn-ghost btn-sm" onclick="window.checkSkillUpdates('${escapeHtml(name)}')" data-i18n="auto.checkUpdates">🔍 Check Updates</button>
+          <button class="btn btn-ghost btn-sm" onclick="window.loadAgentSkills(document.getElementById('agent-tab-content'), '${escapeHtml(name)}')" data-i18n="home.refresh">↻ Refresh</button>
         </div>
       </div>
       ${skillsHtml}
       <details style="margin-top:16px;">
-        <summary style="cursor:pointer;color:var(--fg-muted);font-size:12px;padding:8px 0;">Raw Output</summary>
+        <summary style="cursor:pointer;color:var(--fg-muted);font-size:12px;padding:8px 0;" data-i18n="auto.rawOutput">Raw Output</summary>
         <pre style="background:var(--bg-inset);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:10px;line-height:1.4;white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto;color:var(--fg-muted);">${escapeHtml(output)}</pre>
       </details>
     `;
   } catch (e) {
-    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    container.innerHTML = `<div class="card"><div class="card-title" data-i18n="common.error">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -1795,12 +3017,12 @@ window.uninstallSkill = async function(skillName, profile) {
 
 window.checkSkillUpdates = async function(profile) {
   try {
-    showToast('Checking for updates...', 'info');
+    showToast(t('toast.checkingUpdates'), 'info');
     const res = await api('/api/skills/check', { method: 'POST', body: JSON.stringify({ profile }) });
     if (res.ok && res.output) {
       const updates = parseSkillTable(res.output);
       if (updates.length === 0) {
-        await customAlert('All skills are up to date!', 'Skill Updates');
+        await customAlert(t('dialog.allSkillsUpToDate'), 'Skill Updates');
       } else {
         let html = '<div style="max-height:400px;overflow-y:auto;">';
         for (const u of updates) {
@@ -1820,9 +3042,9 @@ window.checkSkillUpdates = async function(profile) {
       await customAlert(res.error || 'Check failed', 'Error');
     } else if (res.output && res.output.includes('unavailable')) {
       // Skills exist but source is unavailable — not an error, show info
-      await customAlert('Some installed skills could not be checked (source unavailable). This does not indicate an update is needed.', 'Skill Updates');
+      await customAlert(t('dialog.skillsCheckPartial'), 'Skill Updates');
     } else if (!res.output || res.output.includes('0 update') || res.output.includes('up to date')) {
-      await customAlert('All skills are up to date!', 'Skill Updates');
+      await customAlert(t('dialog.allSkillsUpToDate'), 'Skill Updates');
     } else {
       // Has updates
       const updates = parseSkillTable(res.output);
@@ -1846,16 +3068,16 @@ async function loadAgentSessions(container, name) {
   container.innerHTML = `
     <div class="card-grid" style="margin-bottom:16px;">
       <div class="card" id="session-stats-${name}">
-        <div class="card-title">Session Stats</div>
-        <div class="loading">Loading stats...</div>
+        <div class="card-title" data-i18n="auto.sessionStats">Session Stats</div>
+        <div class="loading" data-i18n="auto.loadingStats">Loading stats...</div>
       </div>
     </div>
     <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;">
       <input type="text" id="session-search" class="search-input" placeholder="Search sessions..." style="flex:1;" />
-      <button class="btn btn-ghost" id="session-refresh-btn">↻ Refresh</button>
+      <button class="btn btn-ghost" id="session-refresh-btn" data-i18n="home.refresh">↻ Refresh</button>
     </div>
     <div id="sessions-table">
-      <div class="loading">Loading sessions...</div>
+      <div class="loading" data-i18n="auto.loadingSessions">Loading sessions...</div>
     </div>
   `;
 
@@ -1872,14 +3094,14 @@ async function loadAgentSessions(container, name) {
     try {
       const res = await api(`/api/all-sessions?profile=${encodeURIComponent(name)}`);
       if (!res.ok || !res.sessions || res.sessions.length === 0) {
-        tableEl.innerHTML = '<div class="card"><div class="card-title">No sessions found</div></div>';
+        tableEl.innerHTML = '<div class="card"><div class="card-title" data-i18n="auto.noSessionsFound">No sessions found</div></div>';
         state.currentSessions = [];
         return;
       }
       state.currentSessions = res.sessions;
       renderSessions('');
     } catch (e) {
-      tableEl.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+      tableEl.innerHTML = `<div class="card"><div class="card-title" data-i18n="common.error">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
     }
   }
 
@@ -1896,7 +3118,7 @@ async function loadAgentSessions(container, name) {
 
     const tableEl = document.getElementById('sessions-table');
     if (filtered.length === 0) {
-      tableEl.innerHTML = '<div class="card"><div class="card-title">No matching sessions</div></div>';
+      tableEl.innerHTML = '<div class="card"><div class="card-title" data-i18n="auto.noMatchingSessions">No matching sessions</div></div>';
       return;
     }
 
@@ -1910,12 +3132,12 @@ async function loadAgentSessions(container, name) {
         <table class="data-table">
           <thead>
             <tr>
-              <th>Session ID</th>
-              <th>Title</th>
-              <th>Source</th>
-              <th>Messages</th>
-              <th>Updated</th>
-              <th>Actions</th>
+              <th data-i18n="auto.sessionId">Session ID</th>
+              <th data-i18n="auto.title">Title</th>
+              <th data-i18n="auto.source">Source</th>
+              <th data-i18n="auto.messages">Messages</th>
+              <th data-i18n="auto.updated">Updated</th>
+              <th data-i18n="auto.actions">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -1949,7 +3171,7 @@ async function loadAgentSessions(container, name) {
         </div>
         ${totalPages > 1 ? `
           <div style="display:flex;gap:4px;">
-            <button class="btn btn-ghost btn-sm" ${page <= 0 ? 'disabled style="opacity:0.3;"' : ''} id="sessions-prev">← Prev</button>
+            <button class="btn btn-ghost btn-sm" ${page <= 0 ? 'disabled style="opacity:0.3;"' : ''} id="sessions-prev" data-i18n="auto.prev">← Prev</button>
             <span style="font-size:11px;color:var(--fg-muted);padding:4px 8px;">${page + 1} / ${totalPages}</span>
             <button class="btn btn-ghost btn-sm" ${page >= totalPages - 1 ? 'disabled style="opacity:0.3;"' : ''} id="sessions-next">Next →</button>
           </div>
@@ -1993,21 +3215,21 @@ async function toggleSessionDetail(btn, sessionId, profile) {
 
   detailRow.style.display = '';
   const cell = document.getElementById(`session-detail-${sessionId}`);
-  cell.innerHTML = '<div class="loading" style="padding:16px;">Loading messages...</div>';
+  cell.innerHTML = '<div class="loading" style="padding:16px;" data-i18n="auto.loadingMessages">Loading messages...</div>';
 
   try {
-    const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}`, { credentials: 'include' });
-    if (!r.ok) { cell.innerHTML = '<div class="error-msg" style="padding:16px;">Failed to load messages</div>'; return; }
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?profile=${encodeURIComponent(profile)}&offset=0&limit=50`, { credentials: 'include' });
+    if (!r.ok) { cell.innerHTML = '<div class="error-msg" style="padding:16px;" data-i18n="auto.failedToLoadMessages">Failed to load messages</div>'; return; }
     const data = await r.json();
     if (!data.messages || data.messages.length === 0) {
-      cell.innerHTML = '<div style="color:var(--fg-muted);padding:16px;">No messages in this session</div>';
+      cell.innerHTML = '<div style="color:var(--fg-muted);padding:16px;" data-i18n="auto.noMessagesInThisSession">No messages in this session</div>';
       return;
     }
 
     let html = `<div style="padding:12px 16px;background:var(--bg-panel);border-radius:0 0 8px 8px;border:1px solid var(--border);border-top:0;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
         <span style="font-size:13px;font-weight:600;color:var(--fg);">${escapeHtml(data.title || 'Session ' + sessionId)}</span>
-        <button class="btn btn-ghost btn-sm" onclick="this.closest('tr').style.display='none'">✕ Close</button>
+        <button class="btn btn-ghost btn-sm" onclick="this.closest('tr').style.display='none'" data-i18n="auto.close2">✕ Close</button>
       </div>
       <div style="max-height:400px;overflow-y:auto;">`;
 
@@ -2020,7 +3242,17 @@ async function toggleSessionDetail(btn, sessionId, profile) {
         system: { bg: 'rgba(156,163,175,0.08)', border: '#9ca3af' },
       };
       const rc = roleColors[m.role] || roleColors.system;
-      const ts = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+      // Hermes stores message.timestamp as Unix epoch *seconds* (matches
+      // renderChatMessage in the chat panel). Without *1000 every row
+      // rendered the same epoch-1970 time (~15:18 in CET) instead of the
+      // real send time. Also include the date so the panel is useful for
+      // sessions older than today.
+      const ts = m.timestamp
+        ? new Date(m.timestamp * 1000).toLocaleString([], {
+            year: 'numeric', month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit',
+          })
+        : '';
       let content = toDisplayText(m.content);
       content = content.replace(/Resume this session with:.*$/gm, '');
       content = content.replace(/^Session:\s*\d+.*$/gm, '');
@@ -2059,26 +3291,26 @@ async function loadSessionStats(name) {
       const waMatch = raw.match(/whatsapp:\s+(\d+)\s+sessions/);
 
       el.innerHTML = `
-        <div class="card-title">Session Stats</div>
-        <div class="stat-row"><span class="stat-label">Total sessions</span><span class="stat-value">${totalMatch?.[1] || '—'}</span></div>
-        <div class="stat-row"><span class="stat-label">Total messages</span><span class="stat-value">${messagesMatch?.[1]?.toLocaleString() || '—'}</span></div>
-        <div class="stat-row"><span class="stat-label">DB size</span><span class="stat-value">${dbMatch?.[1] || '—'}</span></div>
-        <div style="margin-top:6px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;">By Platform</div>
+        <div class="card-title" data-i18n="auto.sessionStats">Session Stats</div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.totalSessions">Total sessions</span><span class="stat-value">${totalMatch?.[1] || '—'}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.totalMessages">Total messages</span><span class="stat-value">${messagesMatch?.[1]?.toLocaleString() || '—'}</span></div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.dbSize">DB size</span><span class="stat-value">${dbMatch?.[1] || '—'}</span></div>
+        <div style="margin-top:6px;font-size:10px;color:var(--fg-subtle);text-transform:uppercase;" data-i18n="auto.byPlatform">By Platform</div>
         ${cliMatch ? `<div class="stat-row"><span class="stat-label">CLI</span><span class="stat-value">${cliMatch[1]} sessions</span></div>` : ''}
         ${tgMatch ? `<div class="stat-row"><span class="stat-label">Telegram</span><span class="stat-value">${tgMatch[1]} sessions</span></div>` : ''}
         ${waMatch ? `<div class="stat-row"><span class="stat-label">WhatsApp</span><span class="stat-value">${waMatch[1]} sessions</span></div>` : ''}
       `;
     } else {
-      el.innerHTML = '<div class="card-title">Session Stats</div><div class="stat-row"><span class="stat-label">No stats available</span></div>';
+      el.innerHTML = '<div class="card-title" data-i18n="auto.sessionStats">Session Stats</div><div class="stat-row"><span class="stat-label" data-i18n="auto.noStatsAvailable">No stats available</span></div>';
     }
   } catch {
-    el.innerHTML = '<div class="card-title">Session Stats</div><div class="error-msg">Failed to load stats</div>';
+    el.innerHTML = '<div class="card-title" data-i18n="auto.sessionStats">Session Stats</div><div class="error-msg" data-i18n="auto.failedToLoadStats">Failed to load stats</div>';
   }
 }
 
 async function resumeSession(sessionId) {
-  const agent = state.currentAgent || 'david';
-  const cmd = `hermes -p ${agent} -r ${sessionId}`;
+  const agent = state.currentAgent || state._defaultProfile || 'default';
+  const cmd = `${agent} --tui -r ${sessionId}`;
   openTerminalPanel(`Resume: ${sessionId}`, cmd);
 }
 
@@ -2239,7 +3471,7 @@ async function loadXtermAndConnect(command) {
     observer.observe(document.body, { childList: true });
 
   } catch (e) {
-    bodyEl.innerHTML = `<div style="color:var(--red);padding:20px;">Failed to load terminal: ${e.message}</div>`;
+    bodyEl.innerHTML = `<div style="color:var(--red);padding:20px;">Failed to load terminal: ${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -2247,7 +3479,7 @@ async function renameSession(sessionId, profileName) {
   // Find current title from stored sessions
   const session = (state.currentSessions || []).find(s => s.id === sessionId);
   const currentTitle = session?.title || '';
-  const newTitle = await customPrompt('New session title:', currentTitle);
+  const newTitle = await customPrompt(t('dialog.newSessionTitle'), currentTitle);
   if (newTitle === null || newTitle === currentTitle) return;
   try {
     const csrfToken = state.csrfToken || '';
@@ -2257,10 +3489,10 @@ async function renameSession(sessionId, profileName) {
       headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
       body: JSON.stringify({ title: newTitle, profile: agent }),
     });
-    showToast('Session renamed', 'success');
+    showToast(t('toast.sessionRenamed'), 'success');
     setTimeout(() => loadAgentSessions(document.getElementById('agent-tab-content'), agent), 2000);
   } catch (e) {
-    showToast('Rename failed: ' + e.message, 'error');
+    showToast(t('toast.renameFailedPrefix') + e.message, 'error');
   }
 }
 
@@ -2277,10 +3509,10 @@ async function exportSession(sessionId) {
       a.download = `session-${sessionId}.json`;
       a.click();
       URL.revokeObjectURL(url);
-      showToast('Session exported', 'success');
+      showToast(t('toast.sessionExported'), 'success');
     }
   } catch (e) {
-    showToast('Export failed: ' + e.message, 'error');
+    showToast(t('toast.exportFailedPrefix') + e.message, 'error');
   }
 }
 
@@ -2293,10 +3525,10 @@ async function deleteSession(sessionId, profileName) {
       method: 'DELETE',
       headers: { 'X-CSRF-Token': csrfToken },
     });
-    showToast('Session deleted', 'success');
+    showToast(t('toast.sessionDeleted'), 'success');
     setTimeout(() => loadAgentSessions(document.getElementById('agent-tab-content'), profileName), 2000);
   } catch (e) {
-    showToast('Delete failed: ' + e.message, 'error');
+    showToast(t('toast.deleteFailedPrefix') + e.message, 'error');
   }
 }
 
@@ -2319,21 +3551,22 @@ async function loadAgentGateway(container, name) {
 
     container.innerHTML = `
       <div id="gateway-health" style="margin-bottom:12px;">
-        <div class="loading">Checking gateway health...</div>
+        <div class="loading" data-i18n="auto.checkingGatewayHealth">Checking gateway health...</div>
       </div>
       <div class="card-grid">
         <div class="card">
-          <div class="card-title">Gateway Service</div>
-          <div class="stat-row"><span class="stat-label">Service</span><span class="stat-value">${res.service || '—'}</span></div>
+          <div class="card-title" data-i18n="auto.gatewayService">Gateway Service</div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.service">Service</span><span class="stat-value">${res.service || '—'}</span></div>
           <div class="stat-row"><span class="stat-label">Manager</span><span class="stat-value">${manager}</span></div>
-          <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value ${active ? 'status-ok' : 'status-off'}">${active ? '● Running' : '○ Stopped'}</span></div>
-          <div class="stat-row"><span class="stat-label">Enabled</span><span class="stat-value">${res.enabled ? 'Yes' : 'No'}</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.status">Status</span><span class="stat-value ${active ? 'status-ok' : 'status-off'}">${active ? '● Running' : '○ Stopped'}</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.enabled">Enabled</span><span class="stat-value">${res.enabled ? 'Yes' : 'No'}</span></div>
           ${controlsHtml}
+
         </div>
         <div class="card">
-          <div class="card-title">Connections</div>
+          <div class="card-title" data-i18n="auto.connections">Connections</div>
           <div id="gateway-connections-${name}">
-            <div class="loading">Loading connections...</div>
+            <div class="loading" data-i18n="auto.loadingConnections">Loading connections...</div>
           </div>
         </div>
       </div>
@@ -2345,7 +3578,7 @@ async function loadAgentGateway(container, name) {
     renderGatewayHealth(document.getElementById('gateway-health'), name);
 
   } catch (e) {
-    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    container.innerHTML = `<div class="card"><div class="card-title" data-i18n="common.error">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -2353,7 +3586,7 @@ async function renderGatewayHealth(container, profile) {
   if (!container) return;
   try {
     const res = await api(`/api/gateway/${profile}/health`);
-    if (!res.ok) { container.innerHTML = '<div class="error-msg">Failed to check health</div>'; return; }
+    if (!res.ok) { container.innerHTML = '<div class="error-msg" data-i18n="auto.failedToCheckHealth">Failed to check health</div>'; return; }
 
     const statusIcon = res.healthy ? '🟢' : '🔴';
     const statusText = res.healthy ? 'Healthy' : 'Issues Found';
@@ -2388,14 +3621,14 @@ async function renderGatewayHealth(container, profile) {
     // Auto-fix button
     if (!res.healthy) {
       html += `<div style="margin-top:12px;">
-        <button class="btn btn-primary btn-sm" onclick="fixGateway('${profile}')">🔧 Auto-Fix</button>
+        <button class="btn btn-primary btn-sm" onclick="fixGateway('${profile}')" data-i18n="auto.autofix">🔧 Auto-Fix</button>
       </div>`;
     }
 
     html += '</div>';
     container.innerHTML = html;
   } catch (e) {
-    container.innerHTML = '<div class="error-msg">Health check failed</div>';
+    container.innerHTML = '<div class="error-msg" data-i18n="auto.healthCheckFailed">Health check failed</div>';
   }
 }
 
@@ -2413,17 +3646,17 @@ async function fixGateway(profile) {
   try {
     const res = await api(`/api/gateway/${profile}/start`, { method: 'POST' });
     if (res.ok) {
-      showToast('Gateway restarted', 'success');
+      showToast(t('toast.gatewayRestarted'), 'success');
       // Re-check health after a moment
       setTimeout(() => {
         const el = document.getElementById('gateway-health');
         if (el) renderGatewayHealth(el, profile);
       }, 3000);
     } else {
-      showToast('Failed: ' + (res.error || 'unknown'), 'error');
+      showToast(t('toast.failedPrefix') + (res.error || 'unknown'), 'error');
     }
   } catch (e) {
-    showToast('Error: ' + e.message, 'error');
+    showToast(t('toast.errorPrefix') + e.message, 'error');
   }
 }
 
@@ -2435,7 +3668,7 @@ async function loadGatewayConnections(name) {
   try {
     const res = await api(`/api/gateway/${name}/connections`);
     if (!res.ok || !res.platforms?.length) {
-      el.innerHTML = '<div class="stat-row"><span class="stat-label">No platform data</span></div>';
+      el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.noPlatformData">No platform data</span></div>';
       return;
     }
     el.innerHTML = res.platforms.map(p => {
@@ -2445,14 +3678,14 @@ async function loadGatewayConnections(name) {
       return `<div class="stat-row"><span class="stat-label">${escapeHtml(p.name)}</span><span class="stat-value ${statusClass}">${icon} ${p.connected ? 'connected' : 'not configured'}${detail}</span></div>`;
     }).join('');
   } catch {
-    el.innerHTML = '<div class="stat-row"><span class="stat-label">Error loading connections</span></div>';
+    el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.errorLoadingConnections">Error loading connections</span></div>';
   }
 }
 
 async function loadGatewayLogs(name) {
   const viewer = document.getElementById('log-viewer');
   if (!viewer) return;
-  viewer.innerHTML = '<div class="loading">Loading logs...</div>';
+  viewer.innerHTML = '<div class="loading" data-i18n="auto.loadingLogs">Loading logs...</div>';
 
   const activeTab = document.querySelector('#log-tabs .tab.active')?.dataset.log || 'agent';
   const level = document.getElementById('log-level')?.value || '';
@@ -2463,10 +3696,10 @@ async function loadGatewayLogs(name) {
     if (res.ok) {
       viewer.innerHTML = `<pre style="margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;color:var(--fg-muted);">${escapeHtml(res.logs || 'No logs')}</pre>`;
     } else {
-      viewer.innerHTML = '<div class="empty">No logs available</div>';
+      viewer.innerHTML = '<div class="empty" data-i18n="auto.noLogsAvailable">No logs available</div>';
     }
   } catch (e) {
-    viewer.innerHTML = `<div class="error-msg">${e.message}</div>`;
+    viewer.innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -2501,10 +3734,10 @@ async function sseProgressModal(title, url, options = {}) {
     <div class="modal-card" style="width:520px;max-width:90vw;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <div class="modal-title" style="margin:0;">${title}</div>
-        <button class="sse-modal-close" style="display:none;padding:4px 12px;font-size:11px;background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg-muted);cursor:pointer;">✕ Close</button>
+        <button class="sse-modal-close" style="display:none;padding:4px 12px;font-size:11px;background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg-muted);cursor:pointer;" data-i18n="auto.close2">✕ Close</button>
       </div>
       <div class="sse-progress-log" style="margin:12px 0;font-family:var(--font-mono,monospace);font-size:12px;line-height:1.8;max-height:300px;overflow-y:auto;background:var(--bg-inset);border-radius:6px;padding:12px;color:var(--fg-muted);white-space:pre-wrap;"></div>
-      <div class="sse-progress-status" style="font-size:11px;color:var(--fg-muted);">Starting...</div>
+      <div class="sse-progress-status" style="font-size:11px;color:var(--fg-muted);" data-i18n="auto.starting">Starting...</div>
     </div>`;
   document.body.appendChild(overlay);
 
@@ -2635,7 +3868,7 @@ async function loadAgentConfig(container, name) {
   try {
     const res = await api(`/api/config/${name}`);
     if (!res.ok) {
-      container.innerHTML = `<div class="card"><div class="card-title">Config</div><div class="error-msg">${res.error || 'Failed to load config'}</div></div>`;
+      container.innerHTML = `<div class="card"><div class="card-title" data-i18n="auto.config">Config</div><div class="error-msg">${res.error || 'Failed to load config'}</div></div>`;
       return;
     }
 
@@ -2658,12 +3891,12 @@ async function loadAgentConfig(container, name) {
       <div style="margin-bottom:12px;">
         <div class="tabs" id="config-tabs" style="margin:0;">
           ${categories.map((c, i) => `<button class="tab ${i === 0 ? 'active' : ''}" data-cat="${c.key}">${c.label}</button>`).join('')}
-          <button class="tab" data-cat="secrets">Secrets (.env)</button>
-          <button class="tab" data-cat="raw">Raw YAML</button>
+          <button class="tab" data-cat="secrets" data-i18n="auto.secretsEnv">Secrets (.env)</button>
+          <button class="tab" data-cat="raw" data-i18n="auto.rawYaml">Raw YAML</button>
         </div>
       </div>
       <div id="config-content">
-        <div class="loading">Loading...</div>
+        <div class="loading" data-i18n="auto.loading">Loading...</div>
       </div>
     `;
 
@@ -2696,15 +3929,15 @@ async function loadAgentConfig(container, name) {
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': state.csrfToken || '' },
             body: JSON.stringify({ name: keyName, value: newValue })
           });
-          if (res.ok) saved++; else { failed++; showToast('Failed: ' + keyName, 'error'); }
-        } catch (e) { failed++; showToast('Error: ' + keyName, 'error'); }
+          if (res.ok) saved++; else { failed++; showToast(t('toast.failedPrefix') + keyName, 'error'); }
+        } catch (e) { failed++; showToast(t('toast.errorPrefix') + keyName, 'error'); }
       }
       showToast('Saved ' + saved + ' key(s)' + (failed ? ', ' + failed + ' failed' : ''), failed > 0 ? 'warning' : 'success');
       window.renderConfigCategory('secrets');
     };
     window._saveConfigLocal = async function(profile, catKey) {
       const catConfig = state._config?.config[catKey];
-      if (!catConfig) { showToast('Config not loaded', 'error'); return; }
+      if (!catConfig) { showToast(t('toast.configNotLoaded'), 'error'); return; }
       const updated = JSON.parse(JSON.stringify(catConfig));
       document.querySelectorAll('[data-cfg-key]').forEach(input => {
         const key = input.dataset.cfgKey;
@@ -2719,7 +3952,7 @@ async function loadAgentConfig(container, name) {
           headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': state.csrfToken || '' },
           body: JSON.stringify({ config: { [catKey]: updated } })
         });
-        if (res.ok) { state._config.config[catKey] = updated; showToast('Config saved', 'success'); window._cancelEditLocal(catKey); }
+        if (res.ok) { state._config.config[catKey] = updated; showToast(t('toast.configSaved'), 'success'); window._cancelEditLocal(catKey); }
         else { showToast(res.output || 'Save failed', 'error'); }
       } catch (e) { showToast(e.message, 'error'); }
     };
@@ -2741,7 +3974,7 @@ async function loadAgentConfig(container, name) {
     });
 
   } catch (e) {
-    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    container.innerHTML = `<div class="card"><div class="card-title" data-i18n="common.error">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -2763,21 +3996,21 @@ async function loadAgentMemory(container, name) {
       const hd = memory.honcho_data || {};
       providerSection = `
         <div class="card">
-          <div class="card-title">Honcho Memory</div>
-          <div class="stat-row"><span class="stat-label">Provider</span><span class="stat-value status-ok">honcho</span></div>
-          <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value ${hd.connected ? 'status-ok' : 'status-off'}">${hd.connected ? '● Connected' : '○ Disconnected'}</span></div>
-          ${hd.enabled !== undefined ? `<div class="stat-row"><span class="stat-label">Enabled</span><span class="stat-value">${hd.enabled ? 'Yes' : 'No'}</span></div>` : ''}
-          ${hd.host ? `<div class="stat-row"><span class="stat-label">Host</span><span class="stat-value">${escapeHtml(hd.host)}</span></div>` : ''}
-          ${hd.workspace ? `<div class="stat-row"><span class="stat-label">Workspace</span><span class="stat-value">${escapeHtml(hd.workspace)}</span></div>` : ''}
-          ${hd.ai_peer ? `<div class="stat-row"><span class="stat-label">AI Peer</span><span class="stat-value">${escapeHtml(hd.ai_peer)}</span></div>` : ''}
-          ${hd.user_peer ? `<div class="stat-row"><span class="stat-label">User Peer</span><span class="stat-value">${escapeHtml(hd.user_peer)}</span></div>` : ''}
-          ${hd.session_key ? `<div class="stat-row"><span class="stat-label">Session</span><span class="stat-value" style="font-size:11px">${escapeHtml(hd.session_key)}</span></div>` : ''}
-          ${hd.recall_mode ? `<div class="stat-row"><span class="stat-label">Recall Mode</span><span class="stat-value">${escapeHtml(hd.recall_mode)}</span></div>` : ''}
-          ${hd.write_freq ? `<div class="stat-row"><span class="stat-label">Write Freq</span><span class="stat-value">${escapeHtml(hd.write_freq)}</span></div>` : ''}
-          ${hd.config_path ? `<div class="stat-row"><span class="stat-label">Config</span><span class="stat-value" style="font-size:10px;word-break:break-all">${escapeHtml(hd.config_path)}</span></div>` : ''}
+          <div class="card-title" data-i18n="auto.honchoMemory">Honcho Memory</div>
+          <div class="stat-row"><span class="stat-label" data-i18n="home.provider">Provider</span><span class="stat-value status-ok">honcho</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.status">Status</span><span class="stat-value ${hd.connected ? 'status-ok' : 'status-off'}">${hd.connected ? '● Connected' : '○ Disconnected'}</span></div>
+          ${hd.enabled !== undefined ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.enabled">Enabled</span><span class="stat-value">${hd.enabled ? 'Yes' : 'No'}</span></div>` : ''}
+          ${hd.host ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.host">Host</span><span class="stat-value">${escapeHtml(hd.host)}</span></div>` : ''}
+          ${hd.workspace ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.workspace">Workspace</span><span class="stat-value">${escapeHtml(hd.workspace)}</span></div>` : ''}
+          ${hd.ai_peer ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.aiPeer">AI Peer</span><span class="stat-value">${escapeHtml(hd.ai_peer)}</span></div>` : ''}
+          ${hd.user_peer ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.userPeer">User Peer</span><span class="stat-value">${escapeHtml(hd.user_peer)}</span></div>` : ''}
+          ${hd.session_key ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.session">Session</span><span class="stat-value" style="font-size:11px">${escapeHtml(hd.session_key)}</span></div>` : ''}
+          ${hd.recall_mode ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.recallMode">Recall Mode</span><span class="stat-value">${escapeHtml(hd.recall_mode)}</span></div>` : ''}
+          ${hd.write_freq ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.writeFreq">Write Freq</span><span class="stat-value">${escapeHtml(hd.write_freq)}</span></div>` : ''}
+          ${hd.config_path ? `<div class="stat-row"><span class="stat-label" data-i18n="auto.config">Config</span><span class="stat-value" style="font-size:10px;word-break:break-all">${escapeHtml(hd.config_path)}</span></div>` : ''}
           ${hd.representation ? `
             <details style="margin-top:8px;">
-              <summary style="cursor:pointer;color:var(--fg);font-weight:600;font-size:12px;padding:4px 0;">AI Representation</summary>
+              <summary style="cursor:pointer;color:var(--fg);font-weight:600;font-size:12px;padding:4px 0;" data-i18n="auto.aiRepresentation">AI Representation</summary>
               <pre style="background:var(--bg-inset);border:1px solid var(--border);border-radius:8px;padding:10px;font-size:10px;line-height:1.4;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto;color:var(--fg-muted);">${escapeHtml(hd.representation)}</pre>
             </details>
           ` : ''}
@@ -2787,15 +4020,15 @@ async function loadAgentMemory(container, name) {
       providerSection = `
         <div class="card">
           <div class="card-title">${provider} Memory</div>
-          <div class="stat-row"><span class="stat-label">Provider</span><span class="stat-value">${provider}</span></div>
-          <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value">${memory.connected ? '● Connected' : '○ Unknown'}</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="home.provider">Provider</span><span class="stat-value">${provider}</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.status">Status</span><span class="stat-value">${memory.connected ? '● Connected' : '○ Unknown'}</span></div>
         </div>
       `;
     } else {
       providerSection = `
         <div class="card">
-          <div class="card-title">External Provider</div>
-          <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value">Built-in only (MEMORY.md + USER.md)</span></div>
+          <div class="card-title" data-i18n="auto.externalProvider">External Provider</div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.status">Status</span><span class="stat-value" data-i18n="auto.builtinOnlyMemorymdUsermd">Built-in only (MEMORY.md + USER.md)</span></div>
         </div>
       `;
     }
@@ -2803,7 +4036,7 @@ async function loadAgentMemory(container, name) {
     container.innerHTML = `
       <div class="card-grid">
         <div class="card">
-          <div class="card-title">Built-in Memory</div>
+          <div class="card-title" data-i18n="auto.builtinMemory">Built-in Memory</div>
           <div class="stat-row"><span class="stat-label">MEMORY.md</span><span class="stat-value">${memory.memory_chars || 0} / ${memory.memory_max || 2200} chars</span></div>
           <div style="margin-top:8px;">
             <div class="progress-bar">
@@ -2814,7 +4047,7 @@ async function loadAgentMemory(container, name) {
           <div class="stat-row"><span class="stat-label">SOUL.md</span><span class="stat-value">${memory.soul_chars || 0} chars</span></div>
         </div>
         <div class="card">
-          <div class="card-title">File Contents</div>
+          <div class="card-title" data-i18n="auto.fileContents">File Contents</div>
           <details style="margin-bottom:12px;">
             <summary style="cursor:pointer;color:var(--fg);font-weight:600;font-size:13px;padding:8px 0;">MEMORY.md <span style="color:var(--fg-muted);font-weight:400;font-size:11px;">(${memory.memory_chars || 0} chars)</span></summary>
             <pre style="background:var(--bg-inset);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto;color:var(--fg);">${escapeHtml(memory.memory_content || '(empty)')}</pre>
@@ -2832,15 +4065,15 @@ async function loadAgentMemory(container, name) {
       </div>
       <div style="margin-top:16px;">
         <div class="card">
-          <div class="card-title">Context Compression</div>
-          <div class="stat-row"><span class="stat-label">Enabled</span><span class="stat-value">${configRes.config?.compression?.enabled ? '✓ Yes' : '✗ No'}</span></div>
-          <div class="stat-row"><span class="stat-label">Threshold</span><span class="stat-value">${configRes.config?.compression?.threshold || '—'}</span></div>
-          <div class="stat-row"><span class="stat-label">Summary Model</span><span class="stat-value">${configRes.config?.compression?.summary_model || '—'}</span></div>
+          <div class="card-title" data-i18n="auto.contextCompression">Context Compression</div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.enabled">Enabled</span><span class="stat-value">${configRes.config?.compression?.enabled ? '✓ Yes' : '✗ No'}</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.threshold">Threshold</span><span class="stat-value">${configRes.config?.compression?.threshold || '—'}</span></div>
+          <div class="stat-row"><span class="stat-label" data-i18n="auto.summaryModel">Summary Model</span><span class="stat-value">${configRes.config?.compression?.summary_model || '—'}</span></div>
         </div>
       </div>
     `;
   } catch (e) {
-    container.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+    container.innerHTML = `<div class="card"><div class="card-title" data-i18n="common.error">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
   }
 }
 
@@ -2851,12 +4084,12 @@ async function loadAgentCron(container, name) {
   container.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
       <div style="display:flex;gap:8px;align-items:center;">
-        <span id="cron-scheduler-status" class="badge">loading...</span>
-        <span style="font-size:11px;color:var(--fg-muted);">Scheduler</span>
+        <span id="cron-scheduler-status" class="badge" data-i18n="auto.loading2">loading...</span>
+        <span style="font-size:11px;color:var(--fg-muted);" data-i18n="auto.scheduler">Scheduler</span>
       </div>
-      <button class="btn btn-primary btn-sm" onclick="showCreateCronModal('${name}')">+ Create Job</button>
+      <button class="btn btn-primary btn-sm" onclick="showCreateCronModal('${name}')" data-i18n="auto.createJob">+ Create Job</button>
     </div>
-    <div id="cron-list"><div class="loading">Loading cron jobs...</div></div>
+    <div id="cron-list"><div class="loading" data-i18n="auto.loadingCronJobs">Loading cron jobs...</div></div>
   `;
   await loadCronJobs(name);
 }
@@ -2872,8 +4105,8 @@ async function loadCronJobs(profile) {
       statusEl.className = 'badge ' + (res.schedulerRunning ? 'status-ok' : 'status-off');
     }
     const jobs = res.jobs || [];
-    if (jobs.length === 0) { el.innerHTML = '<div class="card"><div class="card-title">No cron jobs</div></div>'; return; }
-    el.innerHTML = '<table class="data-table"><thead><tr><th>Name</th><th>Schedule</th><th>Status</th><th>Next Run</th><th>Actions</th></tr></thead><tbody>' + jobs.map(function(j) {
+    if (jobs.length === 0) { el.innerHTML = '<div class="card"><div class="card-title" data-i18n="auto.noCronJobs">No cron jobs</div></div>'; return; }
+    el.innerHTML = '<table class="data-table"><thead><tr><th data-i18n="auto.name">Name</th><th data-i18n="auto.schedule">Schedule</th><th data-i18n="auto.status">Status</th><th data-i18n="auto.nextRun">Next Run</th><th data-i18n="auto.actions">Actions</th></tr></thead><tbody>' + jobs.map(function(j) {
       var sc = j.status === 'active' ? 'status-ok' : j.status === 'paused' ? 'status-off' : '';
       var nr = j.nextRun ? new Date(j.nextRun).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '\u2014';
       var act = j.status === 'active'
@@ -2898,16 +4131,16 @@ async function cronRemove(profile, jobId, name) {
   if (!await customConfirm('Remove job "' + name + '"?')) return;
   try {
     await api('/api/hermes-cron/' + encodeURIComponent(profile) + '/' + jobId + '/remove', { method: 'POST', headers: { 'X-CSRF-Token': state.csrfToken || '' } });
-    showToast('Job removed', 'success');
+    showToast(t('toast.jobRemoved'), 'success');
     setTimeout(function() { loadCronJobs(profile); }, 500);
-  } catch (e) { showToast('Remove failed: ' + e.message, 'error'); }
+  } catch (e) { showToast(t('toast.removeFailedPrefix') + e.message, 'error'); }
 }
 
 function showCreateCronModal(profile) {
   var overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.style.display = 'flex';
-  overlay.innerHTML = '<div class="modal-card" style="width:500px;max-width:90vw;"><div class="modal-title">Create Cron Job</div><form id="cron-create-form"><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Name</label><input type="text" id="cron-name" placeholder="e.g. Daily health check" style="width:100%;padding:8px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);font-family:var(--font);font-size:12px;" /></div><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Schedule</label><div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;"><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="5m">5m</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="15m">15m</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="30m">30m</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="1h">1h</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="6h">6h</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="12h">12h</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="daily">daily</button></div><input type="text" id="cron-schedule" placeholder="e.g. every 30m or 0 9 * * *" style="width:100%;padding:8px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);font-family:var(--font);font-size:12px;" required /></div><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Prompt (task instruction)</label><textarea id="cron-prompt" rows="3" placeholder="Check system health and report" style="width:100%;resize:vertical;font-family:var(--font);font-size:12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);padding:8px;"></textarea></div><div style="display:flex;gap:8px;margin-bottom:12px;"><div style="flex:1;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Deliver</label><select id="cron-deliver" class="log-level-select" style="width:100%;"><option value="origin">origin</option><option value="local">local</option><option value="telegram">telegram</option><option value="discord">discord</option><option value="slack">slack</option><option value="whatsapp">whatsapp</option><option value="signal">signal</option><option value="matrix">matrix</option><option value="mattermost">mattermost</option><option value="email">email</option><option value="sms">sms</option><option value="homeassistant">homeassistant</option><option value="dingtalk">dingtalk</option><option value="feishu">feishu</option><option value="wecom">wecom</option><option value="weixin">weixin</option><option value="bluebubbles">bluebubbles</option></select></div><div style="flex:1;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Repeat</label><select id="cron-repeat" class="log-level-select" style="width:100%;"><option value="">forever</option><option value="1">once</option><option value="5">5 times</option><option value="10">10 times</option><option value="50">50 times</option></select></div></div><div class="modal-actions"><button type="button" class="btn btn-ghost" id="cron-cancel">Cancel</button><button type="submit" class="btn btn-primary">Create Job</button></div></form></div>';
+  overlay.innerHTML = '<div class="modal-card" style="width:500px;max-width:90vw;"><div class="modal-title" data-i18n="auto.createCronJob">Create Cron Job</div><form id="cron-create-form"><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.name">Name</label><input type="text" id="cron-name" placeholder="e.g. Daily health check" style="width:100%;padding:8px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);font-family:var(--font);font-size:12px;" /></div><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.schedule">Schedule</label><div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;"><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="5m">5m</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="15m">15m</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="30m">30m</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="1h">1h</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="6h">6h</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="12h">12h</button><button type="button" class="btn btn-ghost btn-sm cron-preset" data-val="daily">daily</button></div><input type="text" id="cron-schedule" placeholder="e.g. every 30m or 0 9 * * *" style="width:100%;padding:8px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);font-family:var(--font);font-size:12px;" required /></div><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.promptTaskInstruction">Prompt (task instruction)</label><textarea id="cron-prompt" rows="3" placeholder="Check system health and report" style="width:100%;resize:vertical;font-family:var(--font);font-size:12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);padding:8px;"></textarea></div><div style="display:flex;gap:8px;margin-bottom:12px;"><div style="flex:1;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.deliver">Deliver</label><select id="cron-deliver" class="log-level-select" style="width:100%;"><option value="origin">origin</option><option value="local">local</option><option value="telegram">telegram</option><option value="discord">discord</option><option value="slack">slack</option><option value="whatsapp">whatsapp</option><option value="signal">signal</option><option value="matrix">matrix</option><option value="mattermost">mattermost</option><option value="email">email</option><option value="sms">sms</option><option value="homeassistant">homeassistant</option><option value="dingtalk">dingtalk</option><option value="feishu">feishu</option><option value="wecom">wecom</option><option value="weixin">weixin</option><option value="bluebubbles">bluebubbles</option></select></div><div style="flex:1;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.repeat">Repeat</label><select id="cron-repeat" class="log-level-select" style="width:100%;"><option value="">forever</option><option value="1">once</option><option value="5" data-i18n="auto.5Times">5 times</option><option value="10" data-i18n="auto.10Times">10 times</option><option value="50" data-i18n="auto.50Times">50 times</option></select></div></div><div class="modal-actions"><button type="button" class="btn btn-ghost" id="cron-cancel" data-i18n="auto.cancel">Cancel</button><button type="submit" class="btn btn-primary" data-i18n="auto.createJob2">Create Job</button></div></form></div>';
   document.body.appendChild(overlay);
   overlay.querySelectorAll('.cron-preset').forEach(function(btn) {
     btn.addEventListener('click', function() {
@@ -2925,17 +4158,17 @@ function showCreateCronModal(profile) {
     var name = document.getElementById('cron-name').value.trim();
     var deliver = document.getElementById('cron-deliver').value;
     var repeat = document.getElementById('cron-repeat').value;
-    if (!schedule) { showToast('Schedule required', 'error'); return; }
-    if (!prompt) { showToast('Prompt required', 'error'); return; }
+    if (!schedule) { showToast(t('toast.scheduleRequired'), 'error'); return; }
+    if (!prompt) { showToast(t('toast.promptRequired'), 'error'); return; }
     try {
       var res = await api('/api/hermes-cron/' + encodeURIComponent(profile) + '/create', {
         method: 'POST',
         headers: { 'X-CSRF-Token': state.csrfToken || '' },
         body: JSON.stringify({ schedule: schedule, prompt: prompt, name: name, deliver: deliver, repeat: repeat }),
       });
-      if (res.ok) { showToast('Cron job created', 'success'); overlay.remove(); setTimeout(function() { loadCronJobs(profile); }, 500); }
+      if (res.ok) { showToast(t('toast.cronCreated'), 'success'); overlay.remove(); setTimeout(function() { loadCronJobs(profile); }, 500); }
       else { showToast(res.error || 'Create failed', 'error'); }
-    } catch (err) { showToast('Create failed: ' + err.message, 'error'); }
+    } catch (err) { showToast(t('toast.createFailedPrefix') + err.message, 'error'); }
   });
 }
 
@@ -2943,16 +4176,16 @@ window.showEditCronModal = async function(profile, jobId) {
   // Fetch current job data
   let res;
   try { res = await api('/api/hermes-cron/' + encodeURIComponent(profile)); }
-  catch (e) { showToast('Could not load job data: ' + e.message, 'error'); return; }
+  catch (e) { showToast(t('toast.couldNotLoadJobPrefix') + e.message, 'error'); return; }
 
-  if (!res.ok || !res.jobs) { showToast('Could not load job data', 'error'); return; }
+  if (!res.ok || !res.jobs) { showToast(t('toast.couldNotLoadJob'), 'error'); return; }
   const job = res.jobs.find(j => j.id === jobId);
-  if (!job) { showToast('Job not found', 'error'); return; }
+  if (!job) { showToast(t('toast.jobNotFound'), 'error'); return; }
 
   var overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.style.display = 'flex';
-  overlay.innerHTML = '<div class="modal-card" style="width:500px;max-width:90vw;"><div class="modal-title">Edit Cron Job</div><form id="cron-edit-form"><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Name</label><input type="text" id="cron-edit-name" value="'+escapeHtml(job.name || '')+'" placeholder="e.g. Daily health check" style="width:100%;padding:8px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);font-family:var(--font);font-size:12px;" /></div><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Schedule</label><div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;"><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="5m">5m</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="15m">15m</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="30m">30m</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="1h">1h</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="6h">6h</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="12h">12h</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="daily">daily</button></div><input type="text" id="cron-edit-schedule" value="'+escapeHtml(job.schedule || '')+'" placeholder="e.g. every 30m or 0 9 * *" style="width:100%;padding:8px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);font-family:var(--font);font-size:12px;" required /></div><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Prompt (task instruction)</label><textarea id="cron-edit-prompt" rows="3" placeholder="Check system health and report" style="width:100%;resize:vertical;font-family:var(--font);font-size:12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);padding:8px;">'+escapeHtml(job.prompt || '')+'</textarea></div><div style="display:flex;gap:8px;margin-bottom:12px;"><div style="flex:1;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Deliver</label><select id="cron-edit-deliver" class="log-level-select" style="width:100%;"><option value="origin">origin</option><option value="local">local</option><option value="telegram">telegram</option><option value="discord">discord</option><option value="slack">slack</option><option value="whatsapp">whatsapp</option><option value="signal">signal</option><option value="matrix">matrix</option><option value="mattermost">mattermost</option><option value="email">email</option><option value="sms">sms</option><option value="homeassistant">homeassistant</option><option value="dingtalk">dingtalk</option><option value="feishu">feishu</option><option value="wecom">wecom</option><option value="weixin">weixin</option><option value="bluebubbles">bluebubbles</option></select></div><div style="flex:1;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Repeat</label><select id="cron-edit-repeat" class="log-level-select" style="width:100%;"><option value="">forever</option><option value="1">once</option><option value="5">5 times</option><option value="10">10 times</option><option value="50">50 times</option></select></div></div><div class="modal-actions"><button type="button" class="btn btn-ghost" id="cron-edit-cancel">Cancel</button><button type="submit" class="btn btn-primary">Save Changes</button></div></form></div>';
+  overlay.innerHTML = '<div class="modal-card" style="width:500px;max-width:90vw;"><div class="modal-title" data-i18n="auto.editCronJob">Edit Cron Job</div><form id="cron-edit-form"><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.name">Name</label><input type="text" id="cron-edit-name" value="'+escapeHtml(job.name || '')+'" placeholder="e.g. Daily health check" style="width:100%;padding:8px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);font-family:var(--font);font-size:12px;" /></div><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.schedule">Schedule</label><div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;"><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="5m">5m</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="15m">15m</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="30m">30m</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="1h">1h</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="6h">6h</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="12h">12h</button><button type="button" class="btn btn-ghost btn-sm cron-edit-preset" data-val="daily">daily</button></div><input type="text" id="cron-edit-schedule" value="'+escapeHtml(job.schedule || '')+'" placeholder="e.g. every 30m or 0 9 * *" style="width:100%;padding:8px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);font-family:var(--font);font-size:12px;" required /></div><div style="margin-bottom:12px;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.promptTaskInstruction">Prompt (task instruction)</label><textarea id="cron-edit-prompt" rows="3" placeholder="Check system health and report" style="width:100%;resize:vertical;font-family:var(--font);font-size:12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);padding:8px;">'+escapeHtml(job.prompt || '')+'</textarea></div><div style="display:flex;gap:8px;margin-bottom:12px;"><div style="flex:1;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.deliver">Deliver</label><select id="cron-edit-deliver" class="log-level-select" style="width:100%;"><option value="origin">origin</option><option value="local">local</option><option value="telegram">telegram</option><option value="discord">discord</option><option value="slack">slack</option><option value="whatsapp">whatsapp</option><option value="signal">signal</option><option value="matrix">matrix</option><option value="mattermost">mattermost</option><option value="email">email</option><option value="sms">sms</option><option value="homeassistant">homeassistant</option><option value="dingtalk">dingtalk</option><option value="feishu">feishu</option><option value="wecom">wecom</option><option value="weixin">weixin</option><option value="bluebubbles">bluebubbles</option></select></div><div style="flex:1;"><label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.repeat">Repeat</label><select id="cron-edit-repeat" class="log-level-select" style="width:100%;"><option value="">forever</option><option value="1">once</option><option value="5" data-i18n="auto.5Times">5 times</option><option value="10" data-i18n="auto.10Times">10 times</option><option value="50" data-i18n="auto.50Times">50 times</option></select></div></div><div class="modal-actions"><button type="button" class="btn btn-ghost" id="cron-edit-cancel" data-i18n="auto.cancel">Cancel</button><button type="submit" class="btn btn-primary" data-i18n="auto.saveChanges">Save Changes</button></div></form></div>';
   document.body.appendChild(overlay);
 
   var deliver = job.deliver || 'origin';
@@ -2978,16 +4211,16 @@ window.showEditCronModal = async function(profile, jobId) {
     var name = document.getElementById('cron-edit-name').value.trim();
     var deliverVal = document.getElementById('cron-edit-deliver').value;
     var repeatVal = document.getElementById('cron-edit-repeat').value;
-    if (!schedule) { showToast('Schedule required', 'error'); return; }
+    if (!schedule) { showToast(t('toast.scheduleRequired'), 'error'); return; }
     try {
       var res2 = await api('/api/hermes-cron/' + encodeURIComponent(profile) + '/' + jobId, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': state.csrfToken || '' },
         body: JSON.stringify({ schedule: schedule, prompt: prompt, name: name, deliver: deliverVal, repeat: repeatVal || undefined }),
       });
-      if (res2.ok) { showToast('Cron job updated', 'success'); overlay.remove(); setTimeout(function() { loadCronJobs(profile); }, 500); }
+      if (res2.ok) { showToast(t('toast.cronUpdated'), 'success'); overlay.remove(); setTimeout(function() { loadCronJobs(profile); }, 500); }
       else { showToast(res2.error || 'Update failed', 'error'); }
-    } catch (err) { showToast('Update failed: ' + err.message, 'error'); }
+    } catch (err) { showToast(t('toast.updateFailedPrefix') + err.message, 'error'); }
   });
 };
 
@@ -2996,51 +4229,56 @@ async function loadUsage(container) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">Usage & Analytics</div>
-        <div class="page-subtitle">Token usage, costs, and activity breakdown</div>
+        <div class="page-title" data-i18n="auto.usageAnalytics">Usage & Analytics</div>
+        <div class="page-subtitle" data-i18n="auto.tokenUsageCostsAndActivityBreakdown">Token usage, costs, and activity breakdown</div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
         <select id="usage-days" class="log-level-select">
-          <option value="1">Today</option>
-          <option value="7" selected>7 days</option>
-          <option value="30">30 days</option>
-          <option value="90">90 days</option>
+          <option value="1" data-i18n="auto.today">Today</option>
+          <option value="7" selected data-i18n="auto.7Days">7 days</option>
+          <option value="30" data-i18n="auto.30Days">30 days</option>
+          <option value="90" data-i18n="auto.90Days">90 days</option>
         </select>
         <select id="usage-agent" class="log-level-select">
-          <option value="">All agents</option>
+          <option value="" data-i18n="auto.allAgents">All agents</option>
         </select>
-        <button class="btn btn-primary" id="usage-apply-btn" onclick="fetchUsageData()">Apply</button>
+        <button class="btn btn-primary" id="usage-apply-btn" onclick="fetchUsageData()" data-i18n="auto.apply">Apply</button>
+        <div style="display:flex;align-items:center;gap:4px;">
+          <label style="font-size:11px;color:var(--fg-muted);white-space:nowrap;" data-i18n="auto.budget">Budget $</label>
+          <input type="number" id="usage-budget" class="log-level-select" style="width:72px;" min="0" step="1" placeholder="0" value="${localStorage.getItem('hci_budget_limit') || ''}" />
+        </div>
+        <span id="budget-status-badge" style="display:none;font-size:11px;padding:3px 8px;border-radius:999px;font-weight:600;"></span>
       </div>
     </div>
 
     <!-- Overview stats bar -->
     <div id="usage-overview-bar" class="card" style="margin-top:12px;">
       <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;">
-        <span class="stat-label" style="white-space:nowrap;">Sessions</span>
-        <span class="stat-label" style="white-space:nowrap;">Messages</span>
-        <span class="stat-label" style="white-space:nowrap;">Input Tokens</span>
-        <span class="stat-label" style="white-space:nowrap;">Output Tokens</span>
-        <span class="stat-label" style="white-space:nowrap;">Total Tokens</span>
-        <span class="stat-label" style="white-space:nowrap;">Est. Cost</span>
-        <span class="stat-label" style="white-space:nowrap;">Active Time</span>
-        <span class="stat-label" style="white-space:nowrap;">Avg Session</span>
+        <span class="stat-label" style="white-space:nowrap;" data-i18n="home.sessions">Sessions</span>
+        <span class="stat-label" style="white-space:nowrap;" data-i18n="auto.messages">Messages</span>
+        <span class="stat-label" style="white-space:nowrap;" data-i18n="auto.inputTokens">Input Tokens</span>
+        <span class="stat-label" style="white-space:nowrap;" data-i18n="auto.outputTokens">Output Tokens</span>
+        <span class="stat-label" style="white-space:nowrap;" data-i18n="auto.totalTokens">Total Tokens</span>
+        <span class="stat-label" style="white-space:nowrap;" data-i18n="auto.estCost">Est. Cost</span>
+        <span class="stat-label" style="white-space:nowrap;" data-i18n="auto.activeTime">Active Time</span>
+        <span class="stat-label" style="white-space:nowrap;" data-i18n="auto.avgSession">Avg Session</span>
       </div>
     </div>
 
     <!-- Charts: 2-column layout -->
     <div class="card-grid" style="margin-top:16px;">
       <div class="card">
-        <div class="card-title">Daily Token Trend</div>
+        <div class="card-title" data-i18n="auto.dailyTokenTrend">Daily Token Trend</div>
         <canvas id="usage-chart-tokens" height="160"></canvas>
       </div>
       <div class="card">
         <div style="display:flex;flex-direction:column;gap:16px;">
           <div>
-            <div class="card-title" style="margin-bottom:8px;">Daily Cost</div>
+            <div class="card-title" style="margin-bottom:8px;display:flex;align-items:center;gap:8px;">Daily Cost <span id="monthly-pace-label" style="font-size:11px;font-weight:normal;color:var(--fg-muted);"></span></div>
             <canvas id="usage-chart-cost" height="100"></canvas>
           </div>
           <div>
-            <div class="card-title" style="margin-bottom:8px;">Model Distribution</div>
+            <div class="card-title" style="margin-bottom:8px;" data-i18n="auto.modelDistribution">Model Distribution</div>
             <canvas id="usage-chart-models" height="120"></canvas>
           </div>
         </div>
@@ -3050,15 +4288,15 @@ async function loadUsage(container) {
     <!-- Models + Platforms + Top Tools in one row -->
     <div class="card-grid" style="margin-top:16px;">
       <div class="card">
-        <div class="card-title">Models</div>
+        <div class="card-title" data-i18n="auto.models">Models</div>
         <div id="usage-models-list"></div>
       </div>
       <div class="card">
-        <div class="card-title">Platforms</div>
+        <div class="card-title" data-i18n="home.platforms">Platforms</div>
         <div id="usage-platforms-list"></div>
       </div>
       <div class="card">
-        <div class="card-title">Top Tools</div>
+        <div class="card-title" data-i18n="auto.topTools">Top Tools</div>
         <div id="usage-tools-list"></div>
       </div>
     </div>
@@ -3079,19 +4317,33 @@ async function loadUsage(container) {
   } catch (e) {
     // ignore
   }
-
+  // Budget input change handler
+  const budgetInput = document.getElementById('usage-budget');
+  if (budgetInput) {
+    budgetInput.addEventListener('change', () => {
+      const val = parseFloat(budgetInput.value);
+      if (!isNaN(val) && val > 0) {
+        localStorage.setItem('hci_budget_limit', val);
+      } else {
+        localStorage.removeItem('hci_budget_limit');
+      }
+      // Re-render cost chart with new budget
+      if (_lastUsageData) renderUsageCharts(_lastUsageData.d, _lastUsageData.daily);
+    });
+  }
   await fetchUsageData();
+
 }
 
 async function fetchUsageData() {
   const btn = document.getElementById('usage-apply-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+  if (btn) { btn.disabled = true; btn.textContent = t('ui.loadingEllipsis'); }
 
   // Overview bar — show loading
   const barEl = document.getElementById('usage-overview-bar');
   if (barEl) {
     barEl.innerHTML = `<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;">
-      <span style="color:var(--fg-muted);font-size:13px;">Loading…</span>
+      <span style="color:var(--fg-muted);font-size:13px;" data-i18n="auto.loading3">Loading…</span>
     </div>`;
   }
 
@@ -3118,35 +4370,35 @@ async function fetchUsageData() {
         <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;">
           <div style="text-align:center;min-width:60px;">
             <div style="font-size:20px;font-weight:700;color:var(--gold);">${d.sessions}</div>
-            <div style="font-size:10px;color:var(--fg-muted);">Sessions</div>
+            <div style="font-size:10px;color:var(--fg-muted);" data-i18n="home.sessions">Sessions</div>
           </div>
           <div style="text-align:center;min-width:70px;">
             <div style="font-size:20px;font-weight:700;color:var(--gold);">${(d.messages || 0).toLocaleString()}</div>
-            <div style="font-size:10px;color:var(--fg-muted);">Messages</div>
+            <div style="font-size:10px;color:var(--fg-muted);" data-i18n="auto.messages">Messages</div>
           </div>
           <div style="text-align:center;min-width:90px;">
             <div style="font-size:20px;font-weight:700;color:var(--teal);">${formatNumber(d.inputTokens)}</div>
-            <div style="font-size:10px;color:var(--fg-muted);">Input Tokens</div>
+            <div style="font-size:10px;color:var(--fg-muted);" data-i18n="auto.inputTokens">Input Tokens</div>
           </div>
           <div style="text-align:center;min-width:90px;">
             <div style="font-size:20px;font-weight:700;color:var(--coral);">${formatNumber(d.outputTokens)}</div>
-            <div style="font-size:10px;color:var(--fg-muted);">Output Tokens</div>
+            <div style="font-size:10px;color:var(--fg-muted);" data-i18n="auto.outputTokens">Output Tokens</div>
           </div>
           <div style="text-align:center;min-width:90px;">
             <div style="font-size:20px;font-weight:700;color:var(--gold);">${formatNumber(d.totalTokens)}</div>
-            <div style="font-size:10px;color:var(--fg-muted);">Total Tokens</div>
+            <div style="font-size:10px;color:var(--fg-muted);" data-i18n="auto.totalTokens">Total Tokens</div>
           </div>
           <div style="text-align:center;min-width:70px;">
             <div style="font-size:20px;font-weight:700;color:var(--gold);">${d.cost || '$0.00'}</div>
-            <div style="font-size:10px;color:var(--fg-muted);">Est. Cost</div>
+            <div style="font-size:10px;color:var(--fg-muted);" data-i18n="auto.estCost">Est. Cost</div>
           </div>
           <div style="text-align:center;min-width:80px;">
             <div style="font-size:16px;font-weight:600;color:var(--fg-muted);">${d.activeTime || '—'}</div>
-            <div style="font-size:10px;color:var(--fg-muted);">Active Time</div>
+            <div style="font-size:10px;color:var(--fg-muted);" data-i18n="auto.activeTime">Active Time</div>
           </div>
           <div style="text-align:center;min-width:80px;">
             <div style="font-size:16px;font-weight:600;color:var(--fg-muted);">${d.avgSession || '—'}</div>
-            <div style="font-size:10px;color:var(--fg-muted);">Avg Session</div>
+            <div style="font-size:10px;color:var(--fg-muted);" data-i18n="auto.avgSession">Avg Session</div>
           </div>
         </div>
       `;
@@ -3157,7 +4409,7 @@ async function fetchUsageData() {
     if (modelsEl) {
       modelsEl.innerHTML = d.models && d.models.length > 0
         ? d.models.map(m => `<div class="stat-row"><span class="stat-label">${escapeHtml(m.name)}</span><span class="stat-value">${m.sessions} · ${formatNumber(m.tokens)}</span></div>`).join('')
-        : '<div class="stat-row"><span class="stat-label">No data</span></div>';
+        : '<div class="stat-row"><span class="stat-label" data-i18n="auto.noData">No data</span></div>';
     }
 
     // Platforms
@@ -3165,7 +4417,7 @@ async function fetchUsageData() {
     if (platEl) {
       platEl.innerHTML = d.platforms && d.platforms.length > 0
         ? d.platforms.map(p => `<div class="stat-row"><span class="stat-label">${escapeHtml(p.name)}</span><span class="stat-value">${p.sessions} · ${formatNumber(p.tokens)}</span></div>`).join('')
-        : '<div class="stat-row"><span class="stat-label">No data</span></div>';
+        : '<div class="stat-row"><span class="stat-label" data-i18n="auto.noData">No data</span></div>';
     }
 
     // Top Tools
@@ -3173,7 +4425,7 @@ async function fetchUsageData() {
     if (toolsEl) {
       toolsEl.innerHTML = d.topTools && d.topTools.length > 0
         ? d.topTools.slice(0, 5).map(t => `<div class="stat-row"><span class="stat-label">${escapeHtml(t.name)}</span><span class="stat-value">${t.calls} (${t.pct})</span></div>`).join('')
-        : '<div class="stat-row"><span class="stat-label">No data</span></div>';
+        : '<div class="stat-row"><span class="stat-label" data-i18n="auto.noData">No data</span></div>';
     }
 
     // Charts
@@ -3182,14 +4434,17 @@ async function fetchUsageData() {
   } catch (e) {
     if (barEl) barEl.innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
+    if (btn) { btn.disabled = false; btn.textContent = t('ui.apply'); }
   }
 }
 
 // Chart instances (destroy before re-render)
 const _charts = {};
+let _lastUsageData = null;
 
 function renderUsageCharts(d, daily) {
+  // Cache data for budget re-render
+  _lastUsageData = { d, daily };
   const theme = state.theme === 'light' ? 'light' : 'dark';
   const gridColor = theme === 'dark' ? 'rgba(220,203,181,0.08)' : 'rgba(11,32,31,0.08)';
   const textColor = theme === 'dark' ? '#dccbb5' : '#0b201f';
@@ -3242,35 +4497,145 @@ function renderUsageCharts(d, daily) {
     });
   }
 
-  // Daily Cost Trend
+  // Daily Cost Trend (with monthly projection + budget line)
   const costCanvas = document.getElementById('usage-chart-cost');
   if (costCanvas && daily?.daily && daily.daily.length > 0) {
-    const labels = daily.daily.map(r => r.date);
+    const baseLabels = daily.daily.map(r => r.date);
     const costData = daily.daily.map(r => r.cost || 0);
+
+    // Budget from localStorage
+    const budgetLimit = parseFloat(localStorage.getItem('hci_budget_limit')) || 0;
+
+    // Monthly projection: extend labels through end of current month
+    const today = new Date();
+    const year = today.getFullYear();
+    const month = today.getMonth();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const endOfMonth = `${year}-${String(month + 1).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
+
+    // Build extended labels (existing + remaining days of month)
+    const lastDate = baseLabels[baseLabels.length - 1];
+    const extendedLabels = [...baseLabels];
+    const projectionData = new Array(baseLabels.length).fill(null);
+    let cursor = new Date(lastDate + 'T00:00:00');
+    const endDate = new Date(endOfMonth + 'T00:00:00');
+    while (cursor < endDate) {
+      cursor.setDate(cursor.getDate() + 1);
+      const ds = cursor.toISOString().slice(0, 10);
+      extendedLabels.push(ds);
+      projectionData.push(null);
+    }
+
+    // Calculate weighted average daily cost (recent days weighted more)
+    // Exponential decay: most recent day gets weight 1.0, each older day × 0.85
+    const totalCost = costData.reduce((s, v) => s + v, 0);
+    let weightedSum = 0, weightTotal = 0;
+    for (let i = 0; i < costData.length; i++) {
+      const w = Math.pow(0.85, costData.length - 1 - i); // recent = higher weight
+      weightedSum += costData[i] * w;
+      weightTotal += w;
+    }
+    const avgDailyCost = weightTotal > 0 ? weightedSum / weightTotal : 0;
+    const monthlyPace = avgDailyCost * 30;
+    const simpleAvg = costData.length > 0 ? totalCost / costData.length : 0;
+    // Use weighted if we have 3+ days, otherwise simple average
+    const projAvg = costData.length >= 3 ? avgDailyCost : simpleAvg;
+
+    // Build cumulative cost array for projection (starts from last cumulative cost)
+    const cumulativeActual = [];
+    let cumSum = 0;
+    for (const c of costData) { cumSum += c; cumulativeActual.push(cumSum); }
+    // Fill projection from last actual cumulative
+    const lastCumCost = cumulativeActual.length > 0 ? cumulativeActual[cumulativeActual.length - 1] : 0;
+    const projStart = baseLabels.length;
+    for (let i = 0; i < projectionData.length - projStart; i++) {
+      projectionData[projStart + i] = lastCumCost + projAvg * (i + 1);
+    }
+    // Pad actual cumulative with nulls for the projection range
+    const actualPadded = [...cumulativeActual, ...new Array(extendedLabels.length - cumulativeActual.length).fill(null)];
+
+    // Budget line: constant value across all labels
+    const budgetLine = budgetLimit > 0 ? new Array(extendedLabels.length).fill(budgetLimit) : [];
+
+    // Build datasets
+    const datasets = [
+      {
+        label: 'Cumulative Cost ($)',
+        data: actualPadded,
+        borderColor: '#ffac02',
+        backgroundColor: 'rgba(255,172,2,0.1)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 3,
+        spanGaps: false,
+      },
+      {
+        label: 'Monthly Projection',
+        data: projectionData,
+        borderColor: 'rgba(255,172,2,0.45)',
+        borderDash: [6, 4],
+        backgroundColor: 'transparent',
+        fill: false,
+        tension: 0.3,
+        pointRadius: 0,
+        spanGaps: false,
+      },
+    ];
+    if (budgetLimit > 0) {
+      datasets.push({
+        label: `Budget ($${budgetLimit})`,
+        data: budgetLine,
+        borderColor: '#ff6b6b',
+        borderDash: [8, 4],
+        backgroundColor: 'transparent',
+        fill: false,
+        pointRadius: 0,
+        borderWidth: 2,
+        spanGaps: true,
+      });
+    }
 
     _charts.cost = new Chart(costCanvas, {
       type: 'line',
-      data: {
-        labels,
-        datasets: [{
-          label: 'Cost ($)',
-          data: costData,
-          borderColor: '#ffac02',
-          backgroundColor: 'rgba(255,172,2,0.1)',
-          fill: true,
-          tension: 0.3,
-          pointRadius: 3,
-        }],
-      },
+      data: { labels: extendedLabels, datasets },
       options: {
         responsive: true,
-        plugins: { legend: { display: false } },
+        plugins: {
+          legend: { display: true, labels: { color: textColor, font: { size: 10 }, boxWidth: 12, padding: 8 } },
+          tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: $${ctx.parsed.y.toFixed(4)}` } },
+        },
         scales: {
           x: { ticks: { color: textColor, maxRotation: 45 }, grid: { color: gridColor } },
-          y: { ticks: { color: textColor, callback: v => '$' + v.toFixed(2) }, grid: { color: gridColor } },
+          y: { ticks: { color: textColor, callback: v => '$' + v.toFixed(2) }, grid: { color: gridColor }, beginAtZero: true },
         },
       },
     });
+
+    // Update budget status badge
+    const badge = document.getElementById('budget-status-badge');
+    if (badge) {
+      if (budgetLimit > 0) {
+        badge.style.display = 'inline-block';
+        if (monthlyPace > budgetLimit) {
+          const over = ((monthlyPace / budgetLimit - 1) * 100).toFixed(0);
+          badge.textContent = `⚠ Over budget by ${over}%`;
+          badge.style.backgroundColor = 'rgba(255,107,107,0.15)';
+          badge.style.color = '#ff6b6b';
+        } else {
+          const remaining = ((1 - monthlyPace / budgetLimit) * 100).toFixed(0);
+          badge.textContent = `✓ ${remaining}% under budget`;
+          badge.style.backgroundColor = 'rgba(78,205,196,0.15)';
+          badge.style.color = '#4ecdc4';
+        }
+      } else {
+        badge.style.display = 'none';
+      }
+    }
+    // Update monthly pace label in card title
+    const paceLabel = document.getElementById('monthly-pace-label');
+    if (paceLabel) {
+      paceLabel.textContent = `· ~$${monthlyPace.toFixed(2)}/mo pace`;
+    }
   } else if (costCanvas) {
     // Fallback: model cost distribution
     const models = (d.models || []).slice(0, 6);
@@ -3317,16 +4682,16 @@ async function loadSkills(container) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">Skills Hub</div>
-        <div class="page-subtitle">Browse, install, and manage skills</div>
+        <div class="page-title" data-i18n="auto.skillsHub">Skills Hub</div>
+        <div class="page-subtitle" data-i18n="auto.browseInstallAndManageSkills">Browse, install, and manage skills</div>
       </div>
       <div style="display:flex;gap:8px;">
         <input type="text" id="skills-search-input" class="search-input" placeholder="Search skills..." />
-        <button class="btn btn-ghost" onclick="loadSkills(document.querySelector('.page.active'))">↻ Refresh</button>
+        <button class="btn btn-ghost" onclick="loadSkills(document.querySelector('.page.active'))" data-i18n="home.refresh">↻ Refresh</button>
       </div>
     </div>
     <div id="skills-hub-content">
-      <div class="loading">Loading skills...</div>
+      <div class="loading" data-i18n="auto.loadingSkills">Loading skills...</div>
     </div>
   `;
 
@@ -3335,15 +4700,21 @@ async function loadSkills(container) {
   let totalPages = 1;
   let profiles = [];
   let installedSkills = [];
+  let installedSkillNames = new Set();
 
   // Load profiles for install picker and installed skills for the page summary.
+
   try {
     const [profRes, skillsRes] = await Promise.all([
       api('/api/profiles'),
       api('/api/skills'),
     ]);
     if (profRes.ok) profiles = profRes.profiles || [];
-    if (skillsRes.ok) installedSkills = skillsRes.skills || [];
+    if (skillsRes.ok) {
+      installedSkills = skillsRes.skills || [];
+      installedSkillNames = new Set(installedSkills.map(s => s.identifier || s.name).filter(Boolean));
+    }
+
   } catch {}
 
   async function loadPage(page) {
@@ -3368,7 +4739,7 @@ async function loadSkills(container) {
 
       contentEl.innerHTML = renderInstalledSkillsSection(installedSkills) + renderSkillCatalogSection(skills, { currentPage, totalPages });
     } catch (e) {
-      contentEl.innerHTML = `<div class="card"><div class="card-title">Error</div><div class="error-msg">${e.message}</div></div>`;
+      contentEl.innerHTML = `<div class="card"><div class="card-title" data-i18n="common.error">Error</div><div class="error-msg">${escapeHtml(e.message)}</div></div>`;
     }
   }
 
@@ -3379,13 +4750,13 @@ async function loadSkills(container) {
   document.getElementById('skills-search-input')?.addEventListener('input', async (e) => {
     const q = e.target.value.trim();
     if (q.length < 2) { loadPage(1); return; }
-    contentEl.innerHTML = '<div class="loading">Searching...</div>';
+    contentEl.innerHTML = '<div class="loading" data-i18n="auto.searching">Searching...</div>';
     try {
       const res = await api(`/api/skills/search/${encodeURIComponent(q)}`);
       if (res.ok && res.output) {
         const skills = parseSkillTable(res.output);
         if (skills.length === 0) {
-          contentEl.innerHTML = `<div class="card"><div class="card-title">Search Results</div><div class="stat-row"><span class="stat-label">No skills found for "${escapeHtml(q)}"</span></div></div>`;
+          contentEl.innerHTML = `<div class="card"><div class="card-title" data-i18n="auto.searchResults">Search Results</div><div class="stat-row"><span class="stat-label">No skills found for "${escapeHtml(q)}"</span></div></div>`;
         } else {
           contentEl.innerHTML = `<div class="card"><div class="card-title">Search Results (${skills.length})</div></div>` +
             '<div class="card-grid">' + skills.map(s => `
@@ -3397,14 +4768,16 @@ async function loadSkills(container) {
                   ${s.trust ? `<span class="badge" style="font-size:10px;opacity:0.7;">${escapeHtml(s.trust)}</span>` : ''}
                 </div>
                 <div style="margin-top:8px;display:flex;gap:6px;">
-                  <button class="btn btn-ghost btn-sm" onclick="window.inspectSkill('${escapeHtml(s.identifier || s.name)}')">🔍 Preview</button>
-                  <button class="btn btn-primary btn-sm" onclick="window.installSkill('${escapeHtml(s.identifier || s.name)}')">⬇ Install</button>
+                  <button class="btn btn-ghost btn-sm" onclick="window.inspectSkill('${escapeHtml(s.identifier || s.name)}')" data-i18n="auto.preview2">🔍 Preview</button>
+                  ${installedSkillNames.has(s.identifier || s.name)
+                    ? `<button class="btn btn-ok btn-sm" disabled style="cursor:default;" data-i18n="auto.installed">✅ Installed</button>`
+                    : `<button class="btn btn-primary btn-sm" onclick="window.installSkill('${escapeHtml(s.identifier || s.name)}')" data-i18n="auto.install2">⬇ Install</button>`}
                 </div>
               </div>
             `).join('') + '</div>';
         }
       } else {
-        contentEl.innerHTML = `<div class="card"><div class="card-title">Search Results</div><div class="error-msg">${escapeHtml(res.error || 'Search failed')}</div></div>`;
+        contentEl.innerHTML = `<div class="card"><div class="card-title" data-i18n="auto.searchResults">Search Results</div><div class="error-msg">${escapeHtml(res.error || 'Search failed')}</div></div>`;
       }
     } catch (err) {
       contentEl.innerHTML = `<div class="card"><div class="error-msg">${escapeHtml(err.message)}</div></div>`;
@@ -3420,7 +4793,7 @@ window.inspectSkill = async function(name) {
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.style.display = 'flex';
-  overlay.innerHTML = `<div class="modal-card" style="width:600px;max-width:90vw;"><div class="loading">Loading preview...</div></div>`;
+  overlay.innerHTML = `<div class="modal-card" style="width:600px;max-width:90vw;"><div class="loading" data-i18n="auto.loadingPreview">Loading preview...</div></div>`;
   document.body.appendChild(overlay);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
 
@@ -3430,12 +4803,12 @@ window.inspectSkill = async function(name) {
       <div class="modal-title">${escapeHtml(name)}</div>
       <pre style="background:var(--bg-inset);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:50vh;overflow-y:auto;color:var(--fg);">${escapeHtml(res.ok ? res.output : res.error || 'Failed to load')}</pre>
       <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;">
-        <button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()">Close</button>
-        <button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove();window.installSkill('${escapeHtml(name)}')">⬇️ Install</button>
+        <button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()" data-i18n="auto.close">Close</button>
+        <button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove();window.installSkill('${escapeHtml(name)}')" data-i18n="auto.install">⬇️ Install</button>
       </div>
     `;
   } catch (e) {
-    overlay.querySelector('.modal-card').innerHTML = `<div class="modal-title">Error</div><div class="error-msg">${e.message}</div><button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()" style="margin-top:12px;">Close</button>`;
+    overlay.querySelector('.modal-card').innerHTML = `<div class="modal-title" data-i18n="common.error">Error</div><div class="error-msg">${escapeHtml(e.message)}</div><button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()" style="margin-top:12px;" data-i18n="auto.close">Close</button>`;
   }
 }
 
@@ -3444,7 +4817,7 @@ window.installSkill = async function(skillName) {
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.style.display = 'flex';
-  overlay.innerHTML = `<div class="modal-card" style="width:450px;max-width:90vw;"><div class="loading">Loading...</div></div>`;
+  overlay.innerHTML = `<div class="modal-card" style="width:450px;max-width:90vw;"><div class="loading" data-i18n="auto.loading">Loading...</div></div>`;
   document.body.appendChild(overlay);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
 
@@ -3468,15 +4841,15 @@ window.installSkill = async function(skillName) {
   overlay.querySelector('.modal-card').innerHTML = `
     <div class="modal-title">Install: ${escapeHtml(skillName)}</div>
     <div style="margin-bottom:16px;">
-      <div style="font-size:12px;color:var(--fg-muted);margin-bottom:8px;">Select agent profile</div>
+      <div style="font-size:12px;color:var(--fg-muted);margin-bottom:8px;" data-i18n="auto.selectAgentProfile">Select agent profile</div>
       <div style="display:flex;flex-direction:column;gap:4px;">
-        ${profilesList || '<div style="color:var(--fg-muted);padding:12px;">No profiles found</div>'}
+        ${profilesList || '<div style="color:var(--fg-muted);padding:12px;" data-i18n="auto.noProfilesFound">No profiles found</div>'}
       </div>
     </div>
     <div id="install-status"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
-      <button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
-      <button class="btn btn-primary" onclick="window.doInstallSkill('${escapeHtml(skillName)}')">⬇️ Install</button>
+      <button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()" data-i18n="auto.cancel">Cancel</button>
+      <button class="btn btn-primary" onclick="window.doInstallSkill('${escapeHtml(skillName)}')" data-i18n="auto.install">⬇️ Install</button>
     </div>
   `;
 }
@@ -3486,18 +4859,23 @@ window.doInstallSkill = async function(skillName) {
   const profileEl = overlay?.querySelector('input[name="install-profile"]:checked');
   const profile = profileEl ? profileEl.value : '';
   const statusEl = overlay?.querySelector('#install-status');
-  if (statusEl) statusEl.innerHTML = '<div class="loading">Installing...</div>';
+  if (statusEl) statusEl.innerHTML = '<div class="loading" data-i18n="auto.installing">Installing...</div>';
 
   try {
     const res = await api('/api/skills/install', { method: 'POST', body: JSON.stringify({ skill: skillName, profile }) });
     if (res.ok) {
       if (statusEl) statusEl.innerHTML = `<div style="color:var(--ok);margin-top:8px;">✅ Installed to ${escapeHtml(profile || 'default')}!</div>`;
-      setTimeout(() => overlay?.remove(), 2000);
+      setTimeout(() => {
+        overlay?.remove();
+        // Refresh skills page to update button states
+        const skillsTab = document.querySelector('.tab[data-tab="skills"]');
+        if (skillsTab) skillsTab.click();
+      }, 1500);
     } else {
       if (statusEl) statusEl.innerHTML = `<div style="color:var(--err);margin-top:8px;">❌ ${escapeHtml(res.output || res.error || 'Install failed')}</div>`;
     }
   } catch (e) {
-    if (statusEl) statusEl.innerHTML = `<div style="color:var(--err);margin-top:8px;">❌ ${e.message}</div>`;
+    if (statusEl) statusEl.innerHTML = `<div style="color:var(--err);margin-top:8px;">❌ ${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -3505,21 +4883,21 @@ async function loadUsersPage(container) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">User Management</div>
-        <div class="page-subtitle">Manage users, roles, and permissions</div>
+        <div class="page-title" data-i18n="auto.userManagement">User Management</div>
+        <div class="page-subtitle" data-i18n="auto.manageUsersRolesAndPermissions">Manage users, roles, and permissions</div>
       </div>
     </div>
     <div class="card-grid">
       <div class="card">
-        <div class="card-title">Users</div>
-        <div id="users-page-list"><div class="loading">Loading users...</div></div>
+        <div class="card-title" data-i18n="auto.users">Users</div>
+        <div id="users-page-list"><div class="loading" data-i18n="auto.loadingUsers">Loading users...</div></div>
         <div class="card-actions" style="margin-top:8px;">
-          <button class="btn btn-ghost" onclick="showCreateUser()">+ Create User</button>
+          <button class="btn btn-ghost" onclick="showCreateUser()" data-i18n="auto.createUser2">+ Create User</button>
         </div>
       </div>
       <div class="card">
-        <div class="card-title">Audit Log</div>
-        <div id="audit-log-page"><div class="loading">Loading audit...</div></div>
+        <div class="card-title" data-i18n="auto.auditLog">Audit Log</div>
+        <div id="audit-log-page"><div class="loading" data-i18n="auto.loadingAudit">Loading audit...</div></div>
       </div>
     </div>
   `;
@@ -3543,10 +4921,10 @@ async function loadUsersPage(container) {
         </div>`;
       }).join('');
     } else {
-      el.innerHTML = '<div class="stat-row"><span class="stat-label">No users</span></div>';
+      el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.noUsers">No users</span></div>';
     }
   } catch (e) {
-    document.getElementById('users-page-list').innerHTML = `<div class="error-msg">${e.message}</div>`;
+    document.getElementById('users-page-list').innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 
   // Load audit log for the page
@@ -3590,10 +4968,10 @@ async function loadAuditLogPage() {
       }
       el.innerHTML = html;
     } else {
-      el.innerHTML = '<div class="stat-row"><span class="stat-label">No audit entries</span></div>';
+      el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.noAuditEntries">No audit entries</span></div>';
     }
   } catch (e) {
-    document.getElementById('audit-log-page').innerHTML = `<div class="error-msg">${e.message}</div>`;
+    document.getElementById('audit-log-page').innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -3606,77 +4984,77 @@ async function loadMaintenance(container) {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">Maintenance</div>
-        <div class="page-subtitle">System tools and diagnostics</div>
+        <div class="page-title" data-i18n="auto.maintenance">Maintenance</div>
+        <div class="page-subtitle" data-i18n="auto.systemToolsAndDiagnostics">System tools and diagnostics</div>
       </div>
     </div>
     <div class="card-grid" id="maintenance-grid">
       <div class="card">
-        <div class="card-title">Health Check</div>
+        <div class="card-title" data-i18n="auto.healthCheck">Health Check</div>
         <div id="health-check-results">
-          <div style="font-size:12px;color:var(--fg-muted);margin-bottom:8px;">Test all HCI API endpoints</div>
+          <div style="font-size:12px;color:var(--fg-muted);margin-bottom:8px;" data-i18n="auto.testAllHciApiEndpoints">Test all HCI API endpoints</div>
         </div>
         <div class="card-actions" style="margin-top:8px;">
-          <button class="btn btn-ghost" onclick="runHealthCheck()">🔌 Check APIs</button>
-          <button class="btn btn-ghost" onclick="hcirestart()">⟲ Restart HCI</button>
+          <button class="btn btn-ghost" onclick="runHealthCheck()" data-i18n="auto.checkApis">🔌 Check APIs</button>
+          <button class="btn btn-ghost" onclick="hcirestart()" data-i18n="auto.restartHci">⟲ Restart HCI</button>
         </div>
       </div>
       <div class="card">
-        <div class="card-title">🎯 HCI Update</div>
+        <div class="card-title" data-i18n="auto.hciUpdate2">🎯 HCI Update</div>
         <div class="hci-version-info" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;">
           <div class="stat-item">
-            <span class="stat-label">Version</span>
+            <span class="stat-label" data-i18n="auto.version">Version</span>
             <span class="stat-value" id="hci-current-version">—</span>
           </div>
           <div class="stat-item">
-            <span class="stat-label">Commit</span>
+            <span class="stat-label" data-i18n="auto.commit">Commit</span>
             <span class="stat-value"><code id="hci-current-commit">—</code></span>
           </div>
           <div class="stat-item">
-            <span class="stat-label">Branch</span>
+            <span class="stat-label" data-i18n="auto.branch">Branch</span>
             <span class="stat-value"><code id="hci-current-branch">—</code></span>
           </div>
           <div class="stat-item" id="hci-behind-badge" style="display:none;">
-            <span class="stat-label">Behind</span>
+            <span class="stat-label" data-i18n="auto.behind">Behind</span>
             <span class="stat-value"><span class="badge badge-warning" id="hci-commits-behind">0</span></span>
           </div>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn btn-primary" onclick="checkHCIUpdates()">Check Updates</button>
-          <button class="btn btn-outline" onclick="runUpdateStream('/api/hci/update')">Update All</button>
-          <button class="btn btn-ghost" onclick="runUpdateStream('/api/hci/rollback')">⟲ Rollback</button>
+          <button class="btn btn-primary" onclick="checkHCIUpdates()" data-i18n="auto.checkUpdates2">Check Updates</button>
+          <button class="btn btn-outline" onclick="runUpdateStream('/api/hci/update')" data-i18n="auto.updateAll">Update All</button>
+          <button class="btn btn-ghost" onclick="runUpdateStream('/api/hci/rollback')" data-i18n="auto.rollback">⟲ Rollback</button>
         </div>
       </div>
       <div class="card">
-        <div class="card-title">Doctor</div>
-        <div class="stat-row"><span class="stat-label">Run diagnostics</span></div>
+        <div class="card-title" data-i18n="auto.doctor">Doctor</div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.runDiagnostics">Run diagnostics</span></div>
         <div class="card-actions" style="margin-top:8px;">
-          <button class="btn btn-ghost" onclick="runDoctor()">Run Diagnose</button>
-          <button class="btn btn-ghost" onclick="runDoctor(true)">Auto-fix</button>
+          <button class="btn btn-ghost" onclick="runDoctor()" data-i18n="auto.runDiagnose">Run Diagnose</button>
+          <button class="btn btn-ghost" onclick="runDoctor(true)" data-i18n="auto.autofix2">Auto-fix</button>
         </div>
         <div id="doctor-result" style="margin-top:8px;max-height:500px;overflow-y:auto;"></div>
       </div>
       <div class="card">
-        <div class="card-title">Dump</div>
-        <div class="stat-row"><span class="stat-label">Setup summary for debugging</span></div>
+        <div class="card-title" data-i18n="auto.dump">Dump</div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.setupSummaryForDebugging">Setup summary for debugging</span></div>
         <div class="card-actions" style="margin-top:8px;">
-          <button class="btn btn-ghost" onclick="runDump()">Generate Dump</button>
+          <button class="btn btn-ghost" onclick="runDump()" data-i18n="auto.generateDump">Generate Dump</button>
         </div>
         <div id="dump-result" style="margin-top:8px;"></div>
       </div>
       <div class="card">
-        <div class="card-title">Hermes Update</div>
-        <div class="stat-row"><span class="stat-label">Version</span><span class="stat-value" id="update-version">—</span></div>
+        <div class="card-title" data-i18n="auto.hermesUpdate">Hermes Update</div>
+        <div class="stat-row"><span class="stat-label" data-i18n="auto.version">Version</span><span class="stat-value" id="update-version">—</span></div>
         <div class="card-actions" style="margin-top:8px;">
-          <button class="btn btn-ghost" onclick="runUpdate()">Update Hermes</button>
+          <button class="btn btn-ghost" onclick="runUpdate()" data-i18n="auto.updateHermes">Update Hermes</button>
         </div>
         <div id="update-result" style="margin-top:8px;"></div>
       </div>
       <div class="card">
-        <div class="card-title">Backup & Import</div>
-        <div style="font-size:12px;color:var(--fg-muted);margin-bottom:10px;">Create and restore Hermes data backups</div>
+        <div class="card-title" data-i18n="auto.backupImport">Backup & Import</div>
+        <div style="font-size:12px;color:var(--fg-muted);margin-bottom:10px;" data-i18n="auto.createAndRestoreHermesDataBackups">Create and restore Hermes data backups</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn btn-ghost" onclick="createBackup()">📦 Create Backup</button>
+          <button class="btn btn-ghost" onclick="createBackup()" data-i18n="auto.createBackup">📦 Create Backup</button>
           <label class="btn btn-ghost" style="cursor:pointer;margin:0;">
             📥 Import<input type="file" accept=".zip" onchange="importBackup(this)" style="display:none;" />
           </label>
@@ -3684,7 +5062,7 @@ async function loadMaintenance(container) {
         <div id="backup-result" style="margin-top:8px;"></div>
       </div>
       <div class="card">
-        <div class="card-title">HCI Info</div>
+        <div class="card-title" data-i18n="auto.hciInfo">HCI Info</div>
         <div class="stat-row"><span class="stat-label">GitHub</span><span class="stat-value"><a href="https://github.com/xaspx/hermes-control-interface" target="_blank" style="color:var(--accent);text-decoration:none;">🔗 xaspx/hermes-control-interface</a></span></div>
         <div class="stat-row"><span class="stat-label">Twitter</span><span class="stat-value"><a href="https://x.com/bayendor" target="_blank" style="color:var(--accent);text-decoration:none;">@bayendor</a></span></div>
       </div>
@@ -3722,11 +5100,11 @@ async function loadUsers() {
         </div>`;
       }).join('');
     } else {
-      el.innerHTML = '<div class="stat-row"><span class="stat-label">No users</span></div>';
+      el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.noUsers">No users</span></div>';
     }
   } catch (e) {
     const el = document.getElementById('users-list');
-    if (el) el.innerHTML = `<div class="error-msg">${e.message}</div>`;
+    if (el) el.innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -3755,20 +5133,20 @@ async function deleteUser(username) {
 }
 
 async function createBackup() {
-  if (!await customConfirm('Create a system backup? This may take a moment.', 'Create Backup')) return;
+  if (!await customConfirm(t('dialog.confirmBackup'), 'Create Backup')) return;
   await sseProgressModal('📦 Creating Backup', '/api/backup/create', {
     method: 'POST',
     headers: { 'X-CSRF-Token': state.csrfToken || '' },
     autoCloseMs: 3000,
-    onSuccess: () => { showToast('Backup downloaded', 'success'); },
+    onSuccess: () => { showToast(t('toast.backupDownloaded'), 'success'); },
   });
 }
 
 async function importBackup(input) {
   if (!input.files?.[0]) return;
   const file = input.files[0];
-  if (!file.name.endsWith('.zip')) return showToast('Please select a .zip file', 'error');
-  if (!await customConfirm('Import backup? This will restore data from the backup file.', 'Import Backup')) { input.value = ''; return; }
+  if (!file.name.endsWith('.zip')) return showToast(t('toast.selectZipFile'), 'error');
+  if (!await customConfirm(t('dialog.confirmImport'), 'Import Backup')) { input.value = ''; return; }
 
   const formData = new FormData();
   formData.append('backup', file);
@@ -3778,7 +5156,7 @@ async function importBackup(input) {
     headers: { 'X-CSRF-Token': state.csrfToken || '' },
     body: formData,
     autoCloseMs: 4000,
-    onSuccess: () => { showToast('Backup imported successfully', 'success'); },
+    onSuccess: () => { showToast(t('toast.backupImported'), 'success'); },
   });
   input.value = '';
 }
@@ -3795,10 +5173,10 @@ async function loadAuth() {
         </div>
       `).join('');
     } else {
-      el.innerHTML = '<div class="stat-row"><span class="stat-label">Auth info unavailable</span></div>';
+      el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.authInfoUnavailable">Auth info unavailable</span></div>';
     }
   } catch {
-    document.getElementById('auth-list').innerHTML = '<div class="stat-row"><span class="stat-label">Auth info unavailable</span></div>';
+    document.getElementById('auth-list').innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.authInfoUnavailable">Auth info unavailable</span></div>';
   }
 }
 
@@ -3823,10 +5201,10 @@ async function loadAudit() {
         return `<div style="font-size:11px;padding:2px 0;color:var(--fg-muted);">${escapeHtml(line)}</div>`;
       }).join('');
     } else {
-      el.innerHTML = '<div class="stat-row"><span class="stat-label">No audit entries</span></div>';
+      el.innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.noAuditEntries">No audit entries</span></div>';
     }
   } catch {
-    document.getElementById('audit-log').innerHTML = '<div class="stat-row"><span class="stat-label">Audit unavailable</span></div>';
+    document.getElementById('audit-log').innerHTML = '<div class="stat-row"><span class="stat-label" data-i18n="auto.auditUnavailable">Audit unavailable</span></div>';
   }
 }
 
@@ -3912,10 +5290,10 @@ function renderDoctorOutput(raw) {
 }
 
 async function runHealthCheck() {
-  if (!await customConfirm('Run health check on all API endpoints?', 'Health Check')) return;
+  if (!await customConfirm(t('dialog.confirmHealthCheck'), 'Health Check')) return;
   const el = document.getElementById('health-check-results');
   if (!el) return;
-  el.innerHTML = '<div class="loading">Testing APIs...</div>';
+  el.innerHTML = '<div class="loading" data-i18n="auto.testingApis">Testing APIs...</div>';
   const endpoints = [
     { name: 'Health', url: '/api/health' },
     { name: 'System', url: '/api/system/health' },
@@ -3947,7 +5325,7 @@ async function runDoctor(fix = false) {
   const msg = fix ? 'Run diagnostics with auto-fix? This may modify system settings.' : 'Run diagnostics? This is read-only.';
   if (!await customConfirm(msg, fix ? 'Auto-fix' : 'Diagnostics')) return;
   const el = document.getElementById('doctor-result');
-  el.innerHTML = '<div class="loading">Running diagnostics...</div>';
+  el.innerHTML = '<div class="loading" data-i18n="auto.runningDiagnostics">Running diagnostics...</div>';
   try {
     const csrfToken = state.csrfToken || '';
     const response = await fetch('/api/doctor', {
@@ -3986,7 +5364,7 @@ async function runDoctor(fix = false) {
     if (fullOutput.trim()) {
       el.innerHTML = renderDoctorOutput(fullOutput.trim());
     } else {
-      el.innerHTML = '<div class="error-msg">No output received</div>';
+      el.innerHTML = '<div class="error-msg" data-i18n="auto.noOutputReceived">No output received</div>';
     }
   } catch (e) {
     el.innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
@@ -3994,19 +5372,19 @@ async function runDoctor(fix = false) {
 }
 
 async function runDump() {
-  if (!await customConfirm('Generate system dump? This creates a summary of current configuration.', 'Generate Dump')) return;
+  if (!await customConfirm(t('dialog.confirmSystemDump'), 'Generate Dump')) return;
   const el = document.getElementById('dump-result');
-  el.innerHTML = '<div class="loading">Generating dump...</div>';
+  el.innerHTML = '<div class="loading" data-i18n="auto.generatingDump">Generating dump...</div>';
   try {
     const res = await api('/api/dump');
     el.innerHTML = `<pre style="font-size:10px;white-space:pre-wrap;max-height:300px;overflow-y:auto;color:var(--fg-muted);">${escapeHtml(res.output || 'No output')}</pre>`;
   } catch (e) {
-    el.innerHTML = `<div class="error-msg">${e.message}</div>`;
+    el.innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
 async function runUpdate() {
-  if (!await customConfirm('Update Hermes? This may take a minute.')) return;
+  if (!await customConfirm(t('dialog.confirmUpdateHermes'))) return;
   // Pause notification polling during update to avoid false network errors
   const wasPolling = state.notifInterval;
   if (state.notifInterval) { clearInterval(state.notifInterval); state.notifInterval = null; }
@@ -4038,7 +5416,7 @@ async function showCreateAgent() {
   const name = result.inputs[0] || '';
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
   if (!safeName) {
-    await customAlert('Please enter an agent name first (letters, numbers, hyphens, underscores).', 'Name Required');
+    await customAlert(t('dialog.enterAgentName'), 'Name Required');
     return;
   }
 
@@ -4057,7 +5435,7 @@ async function showCreateAgent() {
     if (!sourceResult || sourceResult.action === null) return;
     const source = (sourceResult.inputs[0] || 'david').replace(/[^a-zA-Z0-9_-]/g, '');
     if (!source) {
-      await customAlert('Invalid source profile name.', 'Error');
+      await customAlert(t('dialog.invalidProfileName'), 'Error');
       return;
     }
     body.cloneArg = '--clone-from';
@@ -4105,38 +5483,38 @@ async function showCreateUser() {
 
   overlay.innerHTML = `
     <div class="modal-card" style="max-width:600px;max-height:85vh;overflow-y:auto;">
-      <div class="modal-title">Create User</div>
+      <div class="modal-title" data-i18n="auto.createUser">Create User</div>
       <form id="create-user-form">
         <div style="margin-bottom:10px;">
-          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Username</label>
+          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.username">Username</label>
           <input class="modal-input" name="username" placeholder="e.g. alice" autocomplete="off" required />
         </div>
         <div style="margin-bottom:10px;">
-          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Password</label>
+          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.password">Password</label>
           <div style="position:relative;">
             <input class="modal-input" name="password" type="password" placeholder="Min 8 characters" autocomplete="new-password" required style="padding-right:36px;" />
             <button type="button" onclick="togglePwVis(this)" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--fg-muted);cursor:pointer;font-size:14px;">👁</button>
           </div>
         </div>
         <div style="margin-bottom:10px;">
-          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Confirm Password</label>
+          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.confirmPassword">Confirm Password</label>
           <div style="position:relative;">
             <input class="modal-input" name="confirm" type="password" placeholder="Re-enter password" autocomplete="new-password" required style="padding-right:36px;" />
             <button type="button" onclick="togglePwVis(this)" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--fg-muted);cursor:pointer;font-size:14px;">👁</button>
           </div>
           <div id="pw-match-msg" style="font-size:11px;margin-top:4px;min-height:16px;"></div>
         </div>
-        <div style="font-size:10px;color:var(--fg-subtle);margin-bottom:10px;padding:6px 8px;background:var(--bg-input);border-radius:var(--radius);">Password rules: min 8 chars, no spaces</div>
+        <div style="font-size:10px;color:var(--fg-subtle);margin-bottom:10px;padding:6px 8px;background:var(--bg-input);border-radius:var(--radius);" data-i18n="auto.passwordRulesMin8CharsNoSpaces">Password rules: min 8 chars, no spaces</div>
         <div style="margin-bottom:10px;">
-          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:6px;">Role</label>
+          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:6px;" data-i18n="auto.role">Role</label>
           <div style="display:flex;gap:6px;margin-bottom:10px;">
-            <button type="button" class="btn btn-ghost btn-sm" onclick="applyCreatePreset('admin', this)">Admin</button>
-            <button type="button" class="btn btn-ghost btn-sm" onclick="applyCreatePreset('viewer', this)">Viewer</button>
-            <button type="button" class="btn btn-ghost btn-sm" onclick="applyCreatePreset('custom', this)">Custom</button>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="applyCreatePreset('admin', this)" data-i18n="auto.admin">Admin</button>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="applyCreatePreset('viewer', this)" data-i18n="auto.viewer">Viewer</button>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="applyCreatePreset('custom', this)" data-i18n="auto.custom">Custom</button>
           </div>
           <input type="hidden" name="role" value="viewer" />
           <div id="perm-custom-list" style="display:none;">
-            <div style="font-size:11px;color:var(--fg-muted);margin-bottom:6px;">Permissions:</div>
+            <div style="font-size:11px;color:var(--fg-muted);margin-bottom:6px;" data-i18n="auto.permissions">Permissions:</div>
             <div style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius);padding:8px;background:var(--bg-input);">
               ${permGroups.map(g => `
                 <div style="margin-bottom:8px;">
@@ -4154,8 +5532,8 @@ async function showCreateUser() {
           </div>
         </div>
         <div class="modal-actions">
-          <button type="button" class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
-          <button type="submit" class="btn btn-primary">Create User</button>
+          <button type="button" class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()" data-i18n="auto.cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" data-i18n="auto.createUser">Create User</button>
         </div>
       </form>
     </div>
@@ -4206,10 +5584,10 @@ async function showCreateUser() {
     const password = fd.get('password') || '';
     const confirm = fd.get('confirm') || '';
     const role = fd.get('role') || 'viewer';
-    if (!username) return showToast('Username required', 'error');
-    if (password.length < 8) return showToast('Password must be at least 8 chars', 'error');
-    if (password !== confirm) return showToast('Passwords do not match', 'error');
-    if (/\s/.test(password)) return showToast('Password cannot contain spaces', 'error');
+    if (!username) return showToast(t('toast.usernameRequired'), 'error');
+    if (password.length < 8) return showToast(t('toast.passwordTooShort'), 'error');
+    if (password !== confirm) return showToast(t('toast.passwordsDontMatch'), 'error');
+    if (/\s/.test(password)) return showToast(t('toast.passwordNoSpaces'), 'error');
     // Collect custom permissions if role is custom
     let perms = {};
     if (role === 'custom') {
@@ -4245,7 +5623,7 @@ async function createUser(username, password, role, permissions) {
 async function showEditUser(username) {
   const usersRes = await api('/api/users');
   const user = usersRes.users?.find(u => u.username === username);
-  if (!user) return showToast('User not found', 'error');
+  if (!user) return showToast(t('toast.userNotFound'), 'error');
 
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
@@ -4279,15 +5657,15 @@ async function showEditUser(username) {
       </div>
       <form id="edit-user-form">
         <div style="margin-bottom:12px;">
-          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:6px;">Role</label>
+          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:6px;" data-i18n="auto.role">Role</label>
           <div style="display:flex;gap:6px;margin-bottom:8px;">
-            <button type="button" class="btn btn-ghost btn-sm" onclick="applyPreset('admin', this)">Admin</button>
-            <button type="button" class="btn btn-ghost btn-sm" onclick="applyPreset('viewer', this)">Viewer</button>
-            <button type="button" class="btn btn-ghost btn-sm" onclick="applyPreset('custom', this)">Custom</button>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="applyPreset('admin', this)" data-i18n="auto.admin">Admin</button>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="applyPreset('viewer', this)" data-i18n="auto.viewer">Viewer</button>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="applyPreset('custom', this)" data-i18n="auto.custom">Custom</button>
           </div>
           <input type="hidden" name="role" id="edit-user-role" value="${user.role}" />
           <div id="edit-perm-custom-list" style="${isCustom ? '' : 'display:none;'}">
-            <div style="font-size:11px;color:var(--fg-muted);margin-bottom:6px;">Permissions:</div>
+            <div style="font-size:11px;color:var(--fg-muted);margin-bottom:6px;" data-i18n="auto.permissions">Permissions:</div>
             <div style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius);padding:8px;background:var(--bg-input);">
               ${permGroups.map(g => `
                 <div style="margin-bottom:8px;">
@@ -4305,11 +5683,11 @@ async function showEditUser(username) {
           </div>
         </div>
         <div style="margin-bottom:12px;">
-          <button type="button" class="btn btn-ghost btn-sm" onclick="showResetPassword('${escapeHtml(username)}')" style="color:var(--coral,#ff6b6b);">🔑 Reset Password</button>
+          <button type="button" class="btn btn-ghost btn-sm" onclick="showResetPassword('${escapeHtml(username)}')" style="color:var(--coral,#ff6b6b);" data-i18n="auto.resetPassword">🔑 Reset Password</button>
         </div>
         <div class="modal-actions">
-          <button type="button" class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
-          <button type="submit" class="btn btn-primary">Save Changes</button>
+          <button type="button" class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()" data-i18n="auto.cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" data-i18n="auto.saveChanges">Save Changes</button>
         </div>
       </form>
     </div>
@@ -4377,14 +5755,14 @@ async function showResetPassword(username) {
       <div class="modal-title">Reset Password: ${escapeHtml(username)}</div>
       <form id="reset-pw-form">
         <div style="margin-bottom:10px;">
-          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">New Password</label>
+          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.newPassword">New Password</label>
           <div style="position:relative;">
             <input class="modal-input" name="password" type="password" placeholder="Min 8 characters" autocomplete="new-password" required style="padding-right:36px;" />
             <button type="button" onclick="togglePwVis(this)" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--fg-muted);cursor:pointer;font-size:14px;">👁</button>
           </div>
         </div>
         <div style="margin-bottom:10px;">
-          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;">Confirm Password</label>
+          <label style="font-size:11px;color:var(--fg-muted);display:block;margin-bottom:4px;" data-i18n="auto.confirmPassword">Confirm Password</label>
           <div style="position:relative;">
             <input class="modal-input" name="confirm" type="password" placeholder="Re-enter password" autocomplete="new-password" required style="padding-right:36px;" />
             <button type="button" onclick="togglePwVis(this)" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--fg-muted);cursor:pointer;font-size:14px;">👁</button>
@@ -4392,8 +5770,8 @@ async function showResetPassword(username) {
           <div id="reset-pw-match-msg" style="font-size:11px;margin-top:4px;min-height:16px;"></div>
         </div>
         <div class="modal-actions">
-          <button type="button" class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()">Cancel</button>
-          <button type="submit" class="btn btn-primary" style="color:var(--coral,#ff6b6b);">Reset Password</button>
+          <button type="button" class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()" data-i18n="auto.cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" style="color:var(--coral,#ff6b6b);" data-i18n="auto.resetPassword2">Reset Password</button>
         </div>
       </form>
     </div>
@@ -4417,8 +5795,8 @@ async function showResetPassword(username) {
     e.preventDefault();
     const newPw = pwInput.value;
     const confirmPw = confInput.value;
-    if (newPw.length < 8) return showToast('Password must be at least 8 chars', 'error');
-    if (newPw !== confirmPw) return showToast('Passwords do not match', 'error');
+    if (newPw.length < 8) return showToast(t('toast.passwordTooShort'), 'error');
+    if (newPw !== confirmPw) return showToast(t('toast.passwordsDontMatch'), 'error');
     try {
       const csrfToken = state.csrfToken || '';
       const res = await api(`/api/users/${encodeURIComponent(username)}/reset-password`, {
@@ -4521,7 +5899,7 @@ function renderNotifications() {
   const all = state.notifications.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
   const shown = all.slice(0, limit);
   if (shown.length === 0) {
-    listEl.innerHTML = '<div class="notif-empty">No notifications</div>';
+    listEl.innerHTML = '<div class="notif-empty" data-i18n="auto.noNotifications">No notifications</div>';
     return;
   }
   listEl.innerHTML = shown.map(n => {
@@ -4604,12 +5982,12 @@ async function api(url, options = {}) {
       headers,
     });
     if (res.status === 401) {
-      showToast('Session expired — please log in again', 'error');
+      showToast(t('toast.sessionExpired'), 'error');
       setLocked(true);
       return { ok: false, error: 'unauthorized' };
     }
     if (res.status === 429) {
-      showToast('Rate limited — slow down', 'warning');
+      showToast(t('toast.rateLimited'), 'warning');
       return { ok: false, error: 'rate-limited' };
     }
     const contentType = res.headers.get('content-type') || '';
@@ -4620,7 +5998,7 @@ async function api(url, options = {}) {
     const text = await res.text();
     return { ok: false, error: text.substring(0, 200) };
   } catch (err) {
-    showToast('Network error — check connection', 'error');
+    showToast(t('toast.networkError'), 'error');
     return { ok: false, error: 'network' };
   }
 }
@@ -4708,11 +6086,11 @@ function init() {
     const errorEl = document.getElementById('password-error');
 
     if (newPass !== confirm) {
-      errorEl.textContent = 'Passwords do not match';
+      errorEl.textContent = t('toast.passwordsDontMatch');
       return;
     }
     if (newPass.length < 8) {
-      errorEl.textContent = 'Password must be at least 8 characters';
+      errorEl.textContent = t('toast.passwordTooShort');
       return;
     }
 
@@ -4731,7 +6109,7 @@ function init() {
         errorEl.textContent = res.error || 'Failed to change password';
       }
     } catch {
-      errorEl.textContent = 'Connection error';
+      errorEl.textContent = t('ui.connectionError');
     }
   });
 
@@ -4856,26 +6234,26 @@ async function loadFileExplorer(container, dirPath = '') {
   container.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">File Explorer</div>
-        <div class="page-subtitle">.hermes directory browser</div>
+        <div class="page-title" data-i18n="auto.fileExplorer">File Explorer</div>
+        <div class="page-subtitle" data-i18n="auto.hermesDirectoryBrowser">.hermes directory browser</div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;">
-        ${isMobile ? `<button class="btn btn-ghost" id="toggle-file-sidebar" onclick="toggleFileSidebar()">☰ Files</button>` : ''}
-        <button class="btn btn-ghost" onclick="loadFileExplorer(document.querySelector('.page.active'), '')">⌂ Root</button>
-        <button class="btn btn-ghost" onclick="loadFileExplorer(document.querySelector('.page.active'), '${dirPath}')">↻ Refresh</button>
+        ${isMobile ? `<button class="btn btn-ghost" id="toggle-file-sidebar" onclick="toggleFileSidebar()" data-i18n="auto.files">☰ Files</button>` : ''}
+        <button class="btn btn-ghost" onclick="loadFileExplorer(document.querySelector('.page.active'), '')" data-i18n="auto.root">⌂ Root</button>
+        <button class="btn btn-ghost" onclick="loadFileExplorer(document.querySelector('.page.active'), '${dirPath}')" data-i18n="home.refresh">↻ Refresh</button>
       </div>
     </div>
     <div class="file-explorer-split">
       ${isMobile ? `<div id="${backdropId}" class="file-sidebar-backdrop" onclick="toggleFileSidebar()" style="display:none;"></div>` : ''}
       <div class="file-tree-panel" id="${sidebarId}" style="${isMobile ? 'display:none;position:fixed;top:0;left:0;bottom:0;width:280px;z-index:300;margin:0;transform:translateX(-100%);transition:transform .25s ease;' : ''}">
-        <div id="file-tree"><div class="loading">Loading...</div></div>
+        <div id="file-tree"><div class="loading" data-i18n="auto.loading">Loading...</div></div>
       </div>
       <div class="file-editor-panel" id="file-editor-panel" style="display:none;">
         <div class="file-editor-toolbar">
-          <span id="file-editor-path" class="file-editor-path">Select a file</span>
+          <span id="file-editor-path" class="file-editor-path" data-i18n="auto.selectAFile">Select a file</span>
           <div style="display:flex;gap:4px;">
             ${isMobile ? `<button class="btn btn-ghost btn-sm" onclick="toggleFileSidebar()" style="display:inline-flex;">☰</button>` : ''}
-            <button class="btn btn-ghost btn-sm" id="file-save-btn" style="display:none;" onclick="saveCurrentFile()">Save</button>
+            <button class="btn btn-ghost btn-sm" id="file-save-btn" style="display:none;" onclick="saveCurrentFile()" data-i18n="auto.save2">Save</button>
           </div>
         </div>
         <textarea id="file-editor-text" class="file-editor-textarea" spellcheck="false" placeholder="Select a file from the tree"></textarea>
@@ -4919,9 +6297,9 @@ async function loadFileExplorer(container, dirPath = '') {
       itemsHtml += `<div class="file-item ${item.type === 'directory' ? 'file-dir' : 'file-file'}" style="min-height:44px;" onclick="${action}"><span>${icon} ${item.name}</span>${size}</div>`;
     }
 
-    treeEl.innerHTML = breadcrumb + (itemsHtml || '<div class="empty">Empty directory</div>');
+    treeEl.innerHTML = breadcrumb + (itemsHtml || '<div class="empty" data-i18n="auto.emptyDirectory">Empty directory</div>');
   } catch (e) {
-    document.getElementById('file-tree').innerHTML = `<div class="error-msg">${e.message}</div>`;
+    document.getElementById('file-tree').innerHTML = `<div class="error-msg">${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -4986,12 +6364,12 @@ async function saveCurrentFile() {
       body: JSON.stringify({ path: window.currentFilePath, content: textEl.value }),
     });
     if (res && res.ok) {
-      showToast('File saved', 'success');
+      showToast(t('toast.fileSaved'), 'success');
     } else {
       showToast(res?.error || 'Save failed', 'error');
     }
   } catch (e) {
-    showToast('Save failed: ' + e.message, 'error');
+    showToast(t('toast.saveFailedPrefix') + e.message, 'error');
   }
 }
 
@@ -5112,6 +6490,25 @@ const LEVEL_STYLES = {
   USR: 'color:var(--purple,#a78bfa)',
 };
 
+// Entry type definitions for structured log badges
+const TYPE_DEFS = {
+  QC:    { keywords: ['quality', 'score', 'eval'],            color: '#a78bfa', label: 'QC' },
+  ALERT: { keywords: ['alert', 'warning', 'critical', 'threshold'], color: '#ff6b6b', label: 'ALERT' },
+  TASK:  { keywords: ['task', 'job', 'running', 'completed'], color: '#4ecdc4', label: 'TASK' },
+  TOOL:  { keywords: ['tool', 'function', 'call'],            color: '#60a5fa', label: 'TOOL' },
+  MCP:   { keywords: ['mcp', 'mcp-server', 'stdio'],         color: '#fb923c', label: 'MCP' },
+};
+
+function detectLogType(message) {
+  if (!message) return null;
+  const lower = message.toLowerCase();
+  // Check MCP first (more specific) before TOOL which shares 'mcp' keyword
+  for (const [type, def] of Object.entries(TYPE_DEFS)) {
+    if (def.keywords.some(kw => lower.includes(kw))) return type;
+  }
+  return null;
+}
+
 async function loadLogs(container) {
   state._logsData = [];
   state._logsAutoRefresh = true;
@@ -5119,6 +6516,7 @@ async function loadLogs(container) {
   state._logsStickyBottom = true;
   state._logsLevel = '';
   state._logsComponent = '';
+  state._logsType = '';
 
   container.innerHTML = `
     <div id="logs-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border);margin-bottom:8px;">
@@ -5131,7 +6529,7 @@ async function loadLogs(container) {
         </select>
       </div>
       <div style="display:flex;align-items:center;gap:4px;">
-        <span style="font-size:11px;color:var(--fg-muted);">Level:</span>
+        <span style="font-size:11px;color:var(--fg-muted);" data-i18n="auto.level">Level:</span>
         <div id="logs-level-btns" style="display:flex;gap:3px;">
           <button class="btn btn-ghost btn-sm logs-lvl-btn active" data-level="" onclick="setLogsLevel('')">ALL</button>
           <button class="btn btn-ghost btn-sm logs-lvl-btn" data-level="info" onclick="setLogsLevel('info')">INF</button>
@@ -5141,7 +6539,18 @@ async function loadLogs(container) {
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:4px;">
-        <span style="font-size:11px;color:var(--fg-muted);">Lines:</span>
+        <span style="font-size:11px;color:var(--fg-muted);" data-i18n="auto.type">Type:</span>
+        <div id="logs-type-btns" style="display:flex;gap:3px;">
+          <button class="btn btn-ghost btn-sm logs-type-btn active" data-type="" onclick="setLogsType('')">ALL</button>
+          <button class="btn btn-ghost btn-sm logs-type-btn" data-type="QC" onclick="setLogsType('QC')" style="color:#a78bfa;">QC</button>
+          <button class="btn btn-ghost btn-sm logs-type-btn" data-type="ALERT" onclick="setLogsType('ALERT')" style="color:#ff6b6b;">ALERT</button>
+          <button class="btn btn-ghost btn-sm logs-type-btn" data-type="TASK" onclick="setLogsType('TASK')" style="color:#4ecdc4;">TASK</button>
+          <button class="btn btn-ghost btn-sm logs-type-btn" data-type="TOOL" onclick="setLogsType('TOOL')" style="color:#60a5fa;">TOOL</button>
+          <button class="btn btn-ghost btn-sm logs-type-btn" data-type="MCP" onclick="setLogsType('MCP')" style="color:#fb923c;">MCP</button>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px;">
+        <span style="font-size:11px;color:var(--fg-muted);" data-i18n="auto.lines">Lines:</span>
         <select id="logs-lines" class="log-level-select" onchange="refreshLogs()" style="width:70px;">
           <option value="50">50</option>
           <option value="100" selected>100</option>
@@ -5150,27 +6559,27 @@ async function loadLogs(container) {
         </select>
       </div>
       <div style="display:flex;align-items:center;gap:4px;">
-        <span style="font-size:11px;color:var(--fg-muted);">Search:</span>
+        <span style="font-size:11px;color:var(--fg-muted);" data-i18n="auto.search">Search:</span>
         <input id="logs-search" class="search-input" placeholder="keyword..." oninput="debounceLogsSearch()" style="width:140px;" />
       </div>
       <div style="display:flex;align-items:center;gap:4px;margin-left:auto;">
-        <button class="btn btn-ghost btn-sm" id="logs-auto-btn" onclick="toggleLogsAuto()">● auto</button>
+        <button class="btn btn-ghost btn-sm" id="logs-auto-btn" onclick="toggleLogsAuto()" data-i18n="auto.auto">● auto</button>
         <select id="logs-mode" class="log-level-select" onchange="setLogsMode(this.value)" style="width:60px;" title="Refresh mode">
           <option value="poll">poll</option>
           <option value="stream">stream</option>
         </select>
-        <button class="btn btn-ghost btn-sm" onclick="clearLogs()">Clear</button>
+        <button class="btn btn-ghost btn-sm" onclick="clearLogs()" data-i18n="auto.clear">Clear</button>
         <button class="btn btn-ghost btn-sm" onclick="refreshLogs()">⟳</button>
       </div>
     </div>
     <div id="logs-component-bar" style="display:none;margin-bottom:6px;padding:4px 8px;background:var(--bg-inset);border-radius:6px;font-size:11px;align-items:center;gap:6px;">
-      <span style="color:var(--fg-muted);">Filtering:</span>
+      <span style="color:var(--fg-muted);" data-i18n="auto.filtering">Filtering:</span>
       <span id="logs-component-tag" style="color:var(--teal);font-weight:600;"></span>
       <button class="btn btn-ghost btn-sm" onclick="clearLogsComponent()" style="font-size:10px;padding:1px 6px;">✕</button>
     </div>
     <div id="logs-panel" style="position:relative;max-height:calc(100vh - 280px);overflow-y:auto;font-family:var(--font-mono,monospace);font-size:12px;line-height:1.7;"></div>
     <div id="logs-jump-btn" style="display:none;position:fixed;bottom:80px;right:24px;z-index:100;">
-      <button class="btn btn-primary btn-sm" onclick="scrollLogsBottom()" style="box-shadow:0 2px 8px rgba(0,0,0,0.3);">↓ New logs</button>
+      <button class="btn btn-primary btn-sm" onclick="scrollLogsBottom()" style="box-shadow:0 2px 8px rgba(0,0,0,0.3);" data-i18n="auto.newLogs">↓ New logs</button>
     </div>
     <div id="logs-stats" style="display:flex;align-items:center;gap:12px;padding:6px 0;font-size:11px;color:var(--fg-muted);border-top:1px solid var(--border);margin-top:8px;"></div>
   `;
@@ -5187,6 +6596,199 @@ async function loadLogs(container) {
   }
 
   refreshLogs();
+}
+
+// ============================================
+// Monitoring Page
+// ============================================
+async function loadMonitoring(container) {
+  container.innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title" data-i18n="auto.systemMonitor">System Monitor</div>
+        <div class="page-subtitle" data-i18n="auto.realtimeSystemResourceMetrics">Real-time system resource metrics</div>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-ghost" onclick="loadMonitoring(document.querySelector('.page.active'))" data-i18n="home.refresh">↻ Refresh</button>
+      </div>
+    </div>
+
+    <!-- Key metrics bar -->
+    <div id="mon-overview" class="mon-overview" style="margin-top:12px;">
+      <div class="loading" data-i18n="auto.loadingMetrics">Loading metrics…</div>
+    </div>
+
+    <!-- Metrics grid -->
+    <div id="mon-grid" class="mon-grid" style="margin-top:16px;">
+      <div class="mon-card" id="mon-cpu">
+        <div class="mon-card-title" data-i18n="auto.cpuUsage">CPU Usage</div>
+        <div class="mon-card-body">
+          <div class="mon-big-val" id="mon-cpu-val">—</div>
+          <div class="mon-sub" id="mon-cpu-sub">%</div>
+          <div class="mon-progress-track">
+            <div class="mon-progress-fill" id="mon-cpu-bar" style="width:0%"></div>
+          </div>
+          <div class="mon-progress-label" id="mon-cpu-pct">—</div>
+        </div>
+      </div>
+      <div class="mon-card" id="mon-mem">
+        <div class="mon-card-title" data-i18n="auto.memory">Memory</div>
+        <div class="mon-card-body">
+          <div class="mon-big-val" id="mon-mem-val">—</div>
+          <div class="mon-sub" id="mon-mem-sub">MB</div>
+          <div class="mon-progress-track">
+            <div class="mon-progress-fill" id="mon-mem-bar" style="width:0%"></div>
+          </div>
+          <div class="mon-progress-label" id="mon-mem-pct">—</div>
+        </div>
+      </div>
+      <div class="mon-card" id="mon-disk">
+        <div class="mon-card-title" data-i18n="auto.disk">Disk</div>
+        <div class="mon-card-body">
+          <div class="mon-big-val" id="mon-disk-val">—</div>
+          <div class="mon-sub" id="mon-disk-sub"></div>
+          <div class="mon-progress-track">
+            <div class="mon-progress-fill" id="mon-disk-bar" style="width:0%"></div>
+          </div>
+          <div class="mon-progress-label" id="mon-disk-pct">—</div>
+        </div>
+      </div>
+      <div class="mon-card" id="mon-procs">
+        <div class="mon-card-title" data-i18n="auto.processes">Processes</div>
+        <div class="mon-card-body">
+          <div class="mon-big-val" id="mon-procs-val">—</div>
+          <div class="mon-sub">running</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Secondary metrics -->
+    <div id="mon-secondary" class="mon-grid" style="margin-top:16px;">
+      <div class="mon-card" id="mon-load">
+        <div class="mon-card-title" data-i18n="auto.loadAverage">Load Average</div>
+        <div class="mon-card-body" style="display:flex;gap:16px;align-items:baseline;">
+          <div><div class="mon-big-val" style="font-size:16px;" id="mon-load1">—</div><div class="mon-sub" style="font-size:10px;">1m</div></div>
+          <div><div class="mon-big-val" style="font-size:16px;" id="mon-load5">—</div><div class="mon-sub" style="font-size:10px;">5m</div></div>
+          <div><div class="mon-big-val" style="font-size:16px;" id="mon-load15">—</div><div class="mon-sub" style="font-size:10px;">15m</div></div>
+        </div>
+      </div>
+      <div class="mon-card" id="mon-net">
+        <div class="mon-card-title" data-i18n="auto.networkIo">Network I/O</div>
+        <div class="mon-card-body" style="display:flex;flex-direction:column;gap:4px;">
+          <div class="mon-stat-row"><span class="mon-stat-label" data-i18n="auto.interface">Interface</span><span class="mon-stat-val" id="mon-net-iface">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label" data-i18n="auto.bytes">Bytes</span><span class="mon-stat-val" id="mon-net-bytes">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label" data-i18n="auto.packets">Packets</span><span class="mon-stat-val" id="mon-net-packets">—</span></div>
+        </div>
+      </div>
+      <div class="mon-card" id="mon-node-mem">
+        <div class="mon-card-title" data-i18n="auto.nodejsMemory">Node.js Memory</div>
+        <div class="mon-card-body" style="display:flex;flex-direction:column;gap:4px;">
+          <div class="mon-stat-row"><span class="mon-stat-label">RSS</span><span class="mon-stat-val" id="mon-node-rss">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label" data-i18n="auto.heapUsed">Heap Used</span><span class="mon-stat-val" id="mon-node-heap">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label" data-i18n="auto.heapTotal">Heap Total</span><span class="mon-stat-val" id="mon-node-heap-total">—</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- System info -->
+    <div id="mon-info" class="mon-grid" style="margin-top:16px;">
+      <div class="mon-card">
+        <div class="mon-card-title" data-i18n="auto.uptime">Uptime</div>
+        <div class="mon-card-body">
+          <div class="mon-big-val" style="font-size:18px;" id="mon-uptime-val">—</div>
+        </div>
+      </div>
+      <div class="mon-card">
+        <div class="mon-card-title" data-i18n="auto.versions">Versions</div>
+        <div class="mon-card-body" style="display:flex;flex-direction:column;gap:4px;">
+          <div class="mon-stat-row"><span class="mon-stat-label">HCI</span><span class="mon-stat-val" id="mon-ver-hci">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label">Hermes</span><span class="mon-stat-val" id="mon-ver-hermes">—</span></div>
+          <div class="mon-stat-row"><span class="mon-stat-label">Node.js</span><span class="mon-stat-val" id="mon-ver-node">—</span></div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Fetch and render metrics
+  await refreshMonitoring();
+
+  // Auto-refresh every 5 seconds
+  if (state._monInterval) clearInterval(state._monInterval);
+  state._monInterval = setInterval(() => refreshMonitoring(), 5000);
+}
+
+async function refreshMonitoring() {
+  try {
+    const r = await api('/api/monitoring');
+    if (!r.ok) {
+      document.getElementById('mon-overview').innerHTML = `<div class="error-msg">${r.error || 'Failed to load metrics'}</div>`;
+      return;
+    }
+
+    // Overview bar
+    document.getElementById('mon-overview').innerHTML = `
+      <div class="mon-overview-inner">
+        <div class="mon-ov-item"><span class="mon-ov-label">CPU</span><span class="mon-ov-val">${r.cpu || '—'}</span></div>
+        <div class="mon-ov-item"><span class="mon-ov-label" data-i18n="auto.memory">Memory</span><span class="mon-ov-val">${r.memory || '—'}</span></div>
+        <div class="mon-ov-item"><span class="mon-ov-label" data-i18n="auto.disk">Disk</span><span class="mon-ov-val">${r.disk || '—'}</span></div>
+        <div class="mon-ov-item"><span class="mon-ov-label" data-i18n="auto.processes">Processes</span><span class="mon-ov-val">${r.processes || 0}</span></div>
+        <div class="mon-ov-item"><span class="mon-ov-label" data-i18n="auto.load">Load</span><span class="mon-ov-val">${r.load?.avg1 || '—'}, ${r.load?.avg5 || '—'}, ${r.load?.avg15 || '—'}</span></div>
+      </div>
+    `;
+
+    // Primary metrics
+    document.getElementById('mon-cpu-val').textContent = r.cpu?.replace('%', '') || '—';
+    document.getElementById('mon-mem-val').textContent = (r.memory || '—').split(' ')[0] || '—';
+    document.getElementById('mon-mem-sub').textContent = (r.memory || '').includes('MB') ? 'MB' : '';
+    document.getElementById('mon-disk-val').textContent = (r.disk || '—').split(' ')[0] || '—';
+    document.getElementById('mon-disk-sub').textContent = (r.disk || '—').split(' ').slice(1).join(' ') || '';
+    document.getElementById('mon-procs-val').textContent = r.processes || 0;
+
+    // Progress bars — color-coded: green (<60%), yellow (60-80%), red (>80%)
+    const getBarColor = (pct) => pct > 80 ? 'var(--danger, #ef4444)' : pct > 60 ? 'var(--warning, #eab308)' : 'var(--success, #22c55e)';
+
+    const cpuPct = r.cpu_pct ?? (parseFloat(r.cpu) || 0);
+    const cpuBar = document.getElementById('mon-cpu-bar');
+    const cpuPctEl = document.getElementById('mon-cpu-pct');
+    if (cpuBar) { cpuBar.style.width = Math.min(cpuPct, 100) + '%'; cpuBar.style.background = getBarColor(cpuPct); }
+    if (cpuPctEl) { cpuPctEl.textContent = cpuPct.toFixed(1) + '%'; cpuPctEl.style.color = getBarColor(cpuPct); }
+
+    const memPct = r.mem_pct ?? 0;
+    const memBar = document.getElementById('mon-mem-bar');
+    const memPctEl = document.getElementById('mon-mem-pct');
+    if (memBar) { memBar.style.width = Math.min(memPct, 100) + '%'; memBar.style.background = getBarColor(memPct); }
+    if (memPctEl) { memPctEl.textContent = memPct.toFixed(1) + '% used'; memPctEl.style.color = getBarColor(memPct); }
+
+    const diskPct = r.disk_pct ?? 0;
+    const diskBar = document.getElementById('mon-disk-bar');
+    const diskPctEl = document.getElementById('mon-disk-pct');
+    if (diskBar) { diskBar.style.width = Math.min(diskPct, 100) + '%'; diskBar.style.background = getBarColor(diskPct); }
+    if (diskPctEl) { diskPctEl.textContent = diskPct.toFixed(1) + '% used'; diskPctEl.style.color = getBarColor(diskPct); }
+
+    // Load averages
+    document.getElementById('mon-load1').textContent = r.load?.avg1 || '—';
+    document.getElementById('mon-load5').textContent = r.load?.avg5 || '—';
+    document.getElementById('mon-load15').textContent = r.load?.avg15 || '—';
+
+    // Network
+    document.getElementById('mon-net-iface').textContent = r.network?.interface || '—';
+    document.getElementById('mon-net-bytes').textContent = formatNumber(parseInt(r.network?.bytes) || 0);
+    document.getElementById('mon-net-packets').textContent = formatNumber(parseInt(r.network?.packets) || 0);
+
+    // Node.js memory
+    document.getElementById('mon-node-rss').textContent = r.node_memory?.rss_mb ? `${r.node_memory.rss_mb} MB` : '—';
+    document.getElementById('mon-node-heap').textContent = r.node_memory?.heap_used_mb ? `${r.node_memory.heap_used_mb} MB` : '—';
+    document.getElementById('mon-node-heap-total').textContent = r.node_memory?.heap_total_mb ? `${r.node_memory.heap_total_mb} MB` : '—';
+
+    // System info
+    document.getElementById('mon-uptime-val').textContent = r.uptime || '—';
+    document.getElementById('mon-ver-hci').textContent = r.hci_version || '—';
+    document.getElementById('mon-ver-hermes').textContent = r.hermes_version || '—';
+    document.getElementById('mon-ver-node').textContent = r.node_version || '—';
+
+  } catch (e) {
+    // Silent fail on refresh errors
+  }
 }
 
 async function refreshLogs() {
@@ -5210,6 +6812,12 @@ async function refreshLogs() {
         logs = logs.filter(l => (l.component || '').toLowerCase() === component.toLowerCase());
       }
 
+      // Client-side type filter
+      const typeFilter = state._logsType || '';
+      if (typeFilter) {
+        logs = logs.filter(l => detectLogType(l.message) === typeFilter);
+      }
+
       state._logsData = logs;
       renderLogs();
     }
@@ -5225,7 +6833,7 @@ function renderLogs() {
 
   const logs = state._logsData;
   if (!logs.length) {
-    panel.innerHTML = `<div style="padding:20px;text-align:center;color:var(--fg-subtle);">No log entries</div>`;
+    panel.innerHTML = `<div style="padding:20px;text-align:center;color:var(--fg-subtle);" data-i18n="auto.noLogEntries">No log entries</div>`;
     if (stats) stats.innerHTML = '';
     return;
   }
@@ -5260,6 +6868,13 @@ function renderLogs() {
     lvlCounts[s] = (lvlCounts[s] || 0) + 1;
   });
 
+  // Type counts
+  const typeCounts = {};
+  logs.forEach(e => {
+    const t = detectLogType(e.message);
+    if (t) typeCounts[t] = (typeCounts[t] || 0) + 1;
+  });
+
   // Collect unique components
   const components = [...new Set(logs.map(e => e.component).filter(Boolean))];
 
@@ -5272,17 +6887,21 @@ function renderLogs() {
     const msg = escapeHtml(e.message || '');
     const countBadge = e.count > 1 ? `<span style="color:var(--coral);font-weight:700;margin-left:4px;">×${e.count}</span>` : '';
     const copyIcon = `<span class="log-copy-icon" onclick="copyLogLine(this)" title="Copy" style="cursor:pointer;opacity:0;transition:opacity 0.15s;color:var(--fg-muted);margin-left:6px;">⧉</span>`;
-
     // Make component clickable for filtering
     const compSpan = comp ? `<span class="log-comp" onclick="setLogsComponent('${escapeHtml(comp)}')" style="cursor:pointer;color:var(--teal);text-decoration:none;" title="Filter by ${escapeHtml(comp)}">${escapeHtml(comp)}</span>` : '';
-
+    // Detect entry type for badge
+    const entryType = detectLogType(e.message);
+    const typeBadge = entryType && TYPE_DEFS[entryType]
+      ? `<span style="color:${TYPE_DEFS[entryType].color};font-weight:600;font-size:10px;letter-spacing:0.3px;background:${TYPE_DEFS[entryType].color}18;padding:0 4px;border-radius:3px;margin-left:4px;cursor:pointer;" onclick="setLogsType('${entryType}')" title="Filter by ${entryType}">${entryType}</span>`
+      : '';
     return `<div class="log-line" onmouseenter="this.querySelector('.log-copy-icon').style.opacity=1" onmouseleave="this.querySelector('.log-copy-icon').style.opacity=0" style="display:flex;align-items:baseline;padding:1px 4px;border-radius:3px;${shortLvl === 'ERR' ? 'background:rgba(255,107,107,0.06);' : ''}${shortLvl === 'WRN' ? 'background:rgba(255,172,2,0.04);' : ''}">
       <span style="color:var(--fg-subtle);user-select:none;min-width:70px;">[${time}]</span>
       <span style="${style};min-width:32px;text-align:center;font-weight:600;user-select:none;">${shortLvl}</span>
-      ${compSpan ? compSpan + ' ' : '<span style="min-width:40px;"></span>'}
-      <span style="flex:1;word-break:break-all;">${msg}${countBadge}</span>${copyIcon}
-    </div>`;
-  }).join('');
+      ${typeBadge}
+     ${compSpan ? compSpan + ' ' : '<span style="min-width:40px;"></span>'}
+     <span style="flex:1;word-break:break-all;">${msg}${countBadge}</span>${copyIcon}
+   </div>`;
+ }).join('');
 
   panel.innerHTML = html;
 
@@ -5299,6 +6918,7 @@ function renderLogs() {
       <span style="color:${LEVEL_STYLES.DBG}">DBG ${lvlCounts.DBG}</span>
       <span style="color:${LEVEL_STYLES.WRN}">WRN ${lvlCounts.WRN}</span>
       <span style="color:${LEVEL_STYLES.ERR}">ERR ${lvlCounts.ERR}</span>
+      ${Object.entries(typeCounts).map(([t, c]) => `<span style="color:${TYPE_DEFS[t]?.color || 'var(--fg-muted)'};margin-left:6px;">${t} ${c}</span>`).join('')}
       ${components.length > 0 ? `<span style="margin-left:auto;color:var(--fg-subtle);">${components.length} components</span>` : ''}
     `;
   }
@@ -5322,6 +6942,14 @@ function setLogsLevel(lvl) {
   state._logsLevel = lvl;
   document.querySelectorAll('.logs-lvl-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.level === lvl);
+  });
+  refreshLogs();
+}
+
+function setLogsType(type) {
+  state._logsType = type;
+  document.querySelectorAll('.logs-type-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.type === type);
   });
   refreshLogs();
 }
@@ -5468,6 +7096,7 @@ window.hasPerm = hasPerm;
 window.refreshLogs = refreshLogs;
 window.toggleLogsAuto = toggleLogsAuto;
 window.setLogsLevel = setLogsLevel;
+window.setLogsType = setLogsType;
 window.setLogsComponent = setLogsComponent;
 window.setLogsMode = setLogsMode;
 window.debounceLogsSearch = debounceLogsSearch;
@@ -5478,6 +7107,19 @@ window.togglePwVis = function(btn) {
   const input = btn.previousElementSibling;
   if (input.type === 'password') { input.type = 'text'; btn.textContent = '🙈'; }
   else { input.type = 'password'; btn.textContent = '👁'; }
+};
+
+function _isSessionPinned(sid) {
+  try { return JSON.parse(localStorage.getItem('hci_pinned_sessions') || '[]').includes(sid); } catch { return false; }
+}
+window.togglePinSession = function(sid) {
+  try {
+    const list = JSON.parse(localStorage.getItem('hci_pinned_sessions') || '[]');
+    const idx = list.indexOf(sid);
+    if (idx >= 0) list.splice(idx, 1); else list.push(sid);
+    localStorage.setItem('hci_pinned_sessions', JSON.stringify(list));
+    refreshChatSidebar();
+  } catch {}
 };
 window.sendChatMessage = sendChatMessage;
 window.loadChatSession = loadChatSession;
@@ -5523,31 +7165,31 @@ function renderPlatformsTab(contentEl, config, profile, isEditMode) {
   if (isEditMode) {
     contentEl.innerHTML = `
       <div class="card">
-        <div class="card-title">🌐 Platforms — Gateway API</div>
+        <div class="card-title" data-i18n="auto.platformsGatewayApi">🌐 Platforms — Gateway API</div>
         <div style="display:flex;flex-direction:column;gap:12px;margin-top:12px;">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
             <input type="checkbox" id="cfg-platforms-enabled" ${enabled ? 'checked' : ''} style="width:16px;height:16px;accent-color:var(--gold);" />
-            <span style="font-size:13px;">Gateway API Enabled</span>
+            <span style="font-size:13px;" data-i18n="auto.gatewayApiEnabled">Gateway API Enabled</span>
           </label>
           <label style="display:flex;flex-direction:column;gap:4px;">
-            <span style="font-size:12px;color:var(--fg-muted);">Host</span>
+            <span style="font-size:12px;color:var(--fg-muted);" data-i18n="auto.host">Host</span>
             <input type="text" id="cfg-platforms-host" value="${escapeHtml(host)}" style="padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:13px;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:4px;">
-            <span style="font-size:12px;color:var(--fg-muted);">Port</span>
+            <span style="font-size:12px;color:var(--fg-muted);" data-i18n="auto.port">Port</span>
             <input type="number" id="cfg-platforms-port" value="${port !== '—' ? port : ''}" style="padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:13px;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:4px;">
-            <span style="font-size:12px;color:var(--fg-muted);">API Key</span>
+            <span style="font-size:12px;color:var(--fg-muted);" data-i18n="auto.apiKey">API Key</span>
             <input type="password" id="cfg-platforms-key" value="${escapeHtml(extra.key || '')}" style="padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:13px;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:4px;">
-            <span style="font-size:12px;color:var(--fg-muted);">CORS Origins (comma-separated)</span>
+            <span style="font-size:12px;color:var(--fg-muted);" data-i18n="auto.corsOriginsCommaseparated">CORS Origins (comma-separated)</span>
             <input type="text" id="cfg-platforms-cors" value="${escapeHtml(cors !== '—' ? cors : '')}" style="padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:13px;" />
           </label>
           <div style="display:flex;gap:8px;">
-            <button class="btn btn-primary" onclick="savePlatformsConfig('${escapeHtml(profile)}')">💾 Save</button>
-            <button class="btn" onclick="cancelEdit('platforms')">Cancel</button>
+            <button class="btn btn-primary" onclick="savePlatformsConfig('${escapeHtml(profile)}')" data-i18n="auto.save">💾 Save</button>
+            <button class="btn" onclick="cancelEdit('platforms')" data-i18n="auto.cancel">Cancel</button>
           </div>
         </div>
       </div>
@@ -5560,19 +7202,19 @@ function renderPlatformsTab(contentEl, config, profile, isEditMode) {
   const statusText = enabled ? 'Active' : 'Disabled';
   contentEl.innerHTML = `
     <div class="card">
-      <div class="card-title">🌐 Platforms — Gateway API</div>
+      <div class="card-title" data-i18n="auto.platformsGatewayApi">🌐 Platforms — Gateway API</div>
       <div class="stat-row">
-        <span class="stat-label">Status</span>
+        <span class="stat-label" data-i18n="auto.status">Status</span>
         <span style="color:${statusColor};font-weight:600;">${statusText}</span>
       </div>
       ${enabled ? `
-      <div class="stat-row"><span class="stat-label">Host</span><span>${escapeHtml(host)}</span></div>
-      <div class="stat-row"><span class="stat-label">Port</span><span style="color:var(--gold);font-weight:600;">${port}</span></div>
-      <div class="stat-row"><span class="stat-label">API Key</span><span>${keySet}</span></div>
+      <div class="stat-row"><span class="stat-label" data-i18n="auto.host">Host</span><span>${escapeHtml(host)}</span></div>
+      <div class="stat-row"><span class="stat-label" data-i18n="auto.port">Port</span><span style="color:var(--gold);font-weight:600;">${port}</span></div>
+      <div class="stat-row"><span class="stat-label" data-i18n="auto.apiKey">API Key</span><span>${keySet}</span></div>
       <div class="stat-row"><span class="stat-label">CORS</span><span style="font-size:11px;">${escapeHtml(cors)}</span></div>
-      ` : '<div class="stat-row"><span class="stat-label" style="color:var(--fg-muted);">Gateway API is not configured. Click Edit to enable.</span></div>'}
+      ` : '<div class="stat-row"><span class="stat-label" style="color:var(--fg-muted);" data-i18n="auto.gatewayApiIsNotConfiguredClickEditToEnable">Gateway API is not configured. Click Edit to enable.</span></div>'}
       <div style="margin-top:12px;">
-        <button class="btn btn-primary" onclick="enableEdit('platforms')">✏️ Edit</button>
+        <button class="btn btn-primary" onclick="enableEdit('platforms')" data-i18n="auto.edit">✏️ Edit</button>
       </div>
     </div>
   `;
@@ -5601,14 +7243,14 @@ window.savePlatformsConfig = async function(profile) {
       body: JSON.stringify({ config: newConfig }),
     });
     if (res.ok) {
-      showToast('Platforms config saved', 'success');
+      showToast(t('toast.platformsSaved'), 'success');
       state._config.config = newConfig;
       cancelEdit('platforms');
     } else {
       showToast(res.error || 'Save failed', 'error');
     }
   } catch (e) {
-    showToast('Save failed: ' + e.message, 'error');
+    showToast(t('toast.saveFailedPrefix') + e.message, 'error');
   }
 };
 
@@ -5620,7 +7262,7 @@ function renderConfigCategory(catKey) {
   const { config, rawYaml, profile } = state._config;
 
   if (catKey === 'raw') {
-    contentEl.innerHTML = `<div class="card"><div class="card-title">Raw Config</div><pre style="font-size:11px;white-space:pre-wrap;max-height:500px;overflow-y:auto;color:var(--fg-muted);">${escapeHtml(rawYaml || JSON.stringify(config, null, 2))}</pre></div>`;
+    contentEl.innerHTML = `<div class="card"><div class="card-title" data-i18n="auto.rawConfig">Raw Config</div><pre style="font-size:11px;white-space:pre-wrap;max-height:500px;overflow-y:auto;color:var(--fg-muted);">${escapeHtml(rawYaml || JSON.stringify(config, null, 2))}</pre></div>`;
     return;
   }
 
@@ -5636,7 +7278,7 @@ function renderConfigCategory(catKey) {
 
   const catConfig = config[catKey];
   if (!catConfig || (typeof catConfig === 'object' && Object.keys(catConfig).length === 0)) {
-    contentEl.innerHTML = `<div class="card"><div class="card-title">${catKey}</div><div class="stat-row"><span class="stat-label">No settings configured</span></div></div>`;
+    contentEl.innerHTML = `<div class="card"><div class="card-title">${catKey}</div><div class="stat-row"><span class="stat-label" data-i18n="auto.noSettingsConfigured">No settings configured</span></div></div>`;
     return;
   }
 
@@ -5711,8 +7353,8 @@ function renderConfigCategory(catKey) {
           ${fieldRows}
         </div>
         <div style="display:flex;gap:8px;margin-top:14px;">
-          <button class="btn btn-primary" onclick="window.saveConfigForm('${profile}','${catKey}')">💾 Save changes</button>
-          <button class="btn btn-ghost" onclick="window.cancelEdit('${catKey}')">↺ Revert</button>
+          <button class="btn btn-primary" onclick="window.saveConfigForm('${profile}','${catKey}')" data-i18n="auto.saveChanges2">💾 Save changes</button>
+          <button class="btn btn-ghost" onclick="window.cancelEdit('${catKey}')" data-i18n="auto.revert">↺ Revert</button>
         </div>
       </div>
     `;
@@ -5759,7 +7401,7 @@ window.renderConfigCategory = renderConfigCategory;
 // Save config from form-based editor
 window.saveConfigForm = async function(profile, category) {
   const catConfig = state._config?.config[category];
-  if (!catConfig) { showToast('Config not loaded', 'error'); return; }
+  if (!catConfig) { showToast(t('toast.configNotLoaded'), 'error'); return; }
 
   // Start with existing config, apply changes
   const updated = JSON.parse(JSON.stringify(catConfig));
@@ -5800,7 +7442,7 @@ window.saveConfigForm = async function(profile, category) {
     });
     if (res.ok) {
       if (state._config) state._config.config[category] = updated;
-      showToast('Config saved', 'success');
+      showToast(t('toast.configSaved'), 'success');
       cancelEdit(category);
     } else {
       showToast(res.output || 'Save failed', 'error');
@@ -5810,11 +7452,11 @@ window.saveConfigForm = async function(profile, category) {
 
 // Secrets editor — grouped categories, hermes-agent dashboard style
 async function loadSecretsTab(contentEl, profile, isEditMode) {
-  contentEl.innerHTML = `<div class="card"><div class="card-title">Environment Secrets</div><div class="loading">Loading secrets...</div></div>`;
+  contentEl.innerHTML = `<div class="card"><div class="card-title" data-i18n="auto.environmentSecrets">Environment Secrets</div><div class="loading" data-i18n="auto.loadingSecrets">Loading secrets...</div></div>`;
   try {
     const res = await api(`/api/keys/${profile}`);
     if (!res.ok) {
-      contentEl.innerHTML = `<div class="card"><div class="card-title">Secrets</div><div class="error-msg">${escapeHtml(res.error || 'Failed to load')}</div></div>`;
+      contentEl.innerHTML = `<div class="card"><div class="card-title" data-i18n="auto.secrets">Secrets</div><div class="error-msg">${escapeHtml(res.error || 'Failed to load')}</div></div>`;
       return;
     }
 
@@ -5826,17 +7468,17 @@ async function loadSecretsTab(contentEl, profile, isEditMode) {
 
     let html = `<div class="card">
       <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">
-        <span>Environment Secrets</span>
+        <span data-i18n="auto.environmentSecrets">Environment Secrets</span>
         <div style="display:flex;gap:8px;align-items:center;">
           ${hasAdvanced ? `<button class="btn btn-ghost btn-sm" id="adv-toggle-btn" onclick="window.toggleAdvancedSecrets()">Show Advanced (${allKeys.filter(k=>k.is_advanced).length})</button>` : ''}
           ${isEditMode
-            ? `<button class="btn btn-primary btn-sm" onclick="window.saveSecrets('${profile}')">💾 Save</button><button class="btn btn-ghost btn-sm" onclick="window.cancelEdit('secrets')">↺ Revert</button>`
-            : `<button class="btn btn-primary btn-sm" onclick="window.enableEdit('secrets')">✏️ Edit</button>`}
+            ? `<button class="btn btn-primary btn-sm" onclick="window.saveSecrets('${profile}')" data-i18n="auto.save">💾 Save</button><button class="btn btn-ghost btn-sm" onclick="window.cancelEdit('secrets')" data-i18n="auto.revert">↺ Revert</button>`
+            : `<button class="btn btn-primary btn-sm" onclick="window.enableEdit('secrets')" data-i18n="auto.edit">✏️ Edit</button>`}
         </div>
       </div>`;
 
     if (categories.length === 0) {
-      html += `<div class="stat-row"><span class="stat-label">No secrets configured</span></div>`;
+      html += `<div class="stat-row"><span class="stat-label" data-i18n="auto.noSecretsConfigured">No secrets configured</span></div>`;
     } else {
       categories.forEach((cat, ci) => {
         const catId = `sec-cat-${ci}`;
@@ -5863,7 +7505,7 @@ async function loadSecretsTab(contentEl, profile, isEditMode) {
                         <input id="${inputId}" type="password" data-secret-name="${escapeHtml(k.name)}" data-secret-new="false" value="" placeholder="${k.has_value ? '••••••••' : 'Enter value...'}" style="flex:1;background:var(--bg-input);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:12px;" />
                         <button type="button" onclick="this.previousElementSibling.type=this.previousElementSibling.type==='password'?'text':'password'" style="background:none;border:none;cursor:pointer;font-size:13px;padding:4px;color:var(--fg-muted);">👁</button>
                       </div>
-                      ${k.provider_url ? `<a href="${escapeHtml(k.provider_url)}" target="_blank" style="font-size:11px;color:var(--teal);text-decoration:none;white-space:nowrap;">Get key →</a>` : '<span style="width:60px;"></span>'}
+                      ${k.provider_url ? `<a href="${escapeHtml(k.provider_url)}" target="_blank" style="font-size:11px;color:var(--teal);text-decoration:none;white-space:nowrap;" data-i18n="auto.getKey">Get key →</a>` : '<span style="width:60px;"></span>'}
                       <button class="btn btn-ghost btn-sm" onclick="window.deleteSecret('${escapeHtml(k.name)}','${profile}')" title="Delete">✕</button>
                     </div>
                   `;
@@ -5877,7 +7519,7 @@ async function loadSecretsTab(contentEl, profile, isEditMode) {
                       <div style="flex:1;">
                         <span class="secret-masked-value" style="font-size:12px;color:var(--fg-muted);font-family:var(--font-mono,monospace);" data-masked="${escapeHtml(k.masked)}">${escapeHtml(k.masked)}</span>
                       </div>
-                      ${k.provider_url ? `<a href="${escapeHtml(k.provider_url)}" target="_blank" style="font-size:11px;color:var(--teal);text-decoration:none;white-space:nowrap;">Get key →</a>` : '<span style="width:60px;"></span>'}
+                      ${k.provider_url ? `<a href="${escapeHtml(k.provider_url)}" target="_blank" style="font-size:11px;color:var(--teal);text-decoration:none;white-space:nowrap;" data-i18n="auto.getKey">Get key →</a>` : '<span style="width:60px;"></span>'}
                       <button class="btn btn-ghost btn-sm" onclick="window.revealSecret('${escapeHtml(k.name)}','${profile}')" title="Reveal">👁</button>
                     </div>
                   `;
@@ -5893,12 +7535,12 @@ async function loadSecretsTab(contentEl, profile, isEditMode) {
     if (isEditMode) {
       html += `
         <div style="margin-top:16px;padding:12px;border:1px dashed var(--border);border-radius:var(--radius);">
-          <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:8px;">+ Add new key</div>
+          <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:8px;" data-i18n="auto.addNewKey">+ Add new key</div>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
             <input id="new-secret-name" type="text" placeholder="KEY_NAME" style="width:180px;background:var(--bg-input);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:12px;font-family:var(--font-mono,monospace);" />
             <input id="new-secret-value" type="password" placeholder="value" style="flex:1;background:var(--bg-input);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:12px;" />
             <button type="button" onclick="this.previousElementSibling.type=this.previousElementSibling.type==='password'?'text':'password'" style="background:none;border:none;cursor:pointer;font-size:13px;padding:4px;color:var(--fg-muted);">👁</button>
-            <button class="btn btn-primary btn-sm" onclick="window.addSecret('${profile}')">Add</button>
+            <button class="btn btn-primary btn-sm" onclick="window.addSecret('${profile}')" data-i18n="auto.add">Add</button>
           </div>
         </div>
       `;
@@ -5944,7 +7586,7 @@ async function loadSecretsTab(contentEl, profile, isEditMode) {
     }
 
   } catch {
-    contentEl.innerHTML = `<div class="card"><div class="card-title">Secrets</div><div class="error-msg">Failed to load secrets</div></div>`;
+    contentEl.innerHTML = `<div class="card"><div class="card-title" data-i18n="auto.secrets">Secrets</div><div class="error-msg" data-i18n="auto.failedToLoadSecrets">Failed to load secrets</div></div>`;
   }
 }
 
@@ -5980,9 +7622,9 @@ window.addSecret = async function(profile) {
   const valueInput = document.getElementById('new-secret-value');
   const name = nameInput?.value.trim();
   const value = valueInput?.value;
-  if (!name) { showToast('Enter a key name', 'error'); return; }
+  if (!name) { showToast(t('toast.enterKeyName'), 'error'); return; }
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-    showToast('Key name must match [A-Za-z_][A-Za-z0-9_]*', 'error'); return;
+    showToast(t('toast.keyNameInvalid'), 'error'); return;
   }
   try {
     const res = await api('/api/keys/' + encodeURIComponent(profile), {
@@ -6074,13 +7716,13 @@ window.saveSecrets = async function(profile) {
 
 window.saveConfig = async function(profile, category) {
   const textarea = document.getElementById('config-edit-textarea');
-  if (!textarea) { showToast('No editor found', 'error'); return; }
+  if (!textarea) { showToast(t('toast.noEditorFound'), 'error'); return; }
 
   let value;
   try {
     value = JSON.parse(textarea.value);
   } catch {
-    showToast('Invalid JSON — fix syntax errors first', 'error');
+    showToast(t('toast.invalidJson'), 'error');
     return;
   }
 
@@ -6100,4 +7742,414 @@ window.saveConfig = async function(profile, category) {
   } catch (e) { showToast(e.message, 'error'); }
 };
 
-init();
+/** Phase 3: Toggle message ⋮ dropdown menu */
+function toggleMsgMenu(btn, role) {
+  // Close any existing menu first
+  closeMsgMenu();
+  // Build menu
+  const menu = document.createElement('div');
+  menu.className = 'msg-menu-dropdown';
+  menu.innerHTML = `<button class="msg-menu-item" onclick="forkFromMessageIdx(this)" data-i18n="auto.forkSessionHere">🔱 Fork session here</button>`;
+  document.body.appendChild(menu);
+  // Position it relative to the button
+  const rect = btn.getBoundingClientRect();
+  menu.style.top = rect.bottom + window.scrollY + 2 + 'px';
+  menu.style.left = rect.left + window.scrollX + 'px';
+  // Store message index on the menu for the fork handler
+  const msgDiv = btn.closest('.chat-msg');
+  const msgs = Array.from(msgDiv.parentElement.querySelectorAll('.chat-msg'));
+  const idx = msgs.indexOf(msgDiv);
+  menu.dataset.msgIdx = idx;
+  menu.dataset.role = role;
+  // Close on outside click
+  setTimeout(() => { document.addEventListener('click', closeMsgMenu, { once: true }); }, 0);
+}
+
+/** Phase 3: Close message menu */
+function closeMsgMenu() {
+  document.querySelectorAll('.msg-menu-dropdown').forEach(m => m.remove());
+}
+
+/** Phase 3: Fork session from the stored message index */
+async function forkFromMessageIdx(el) {
+  closeMsgMenu();
+  const menu = el.closest('.msg-menu-dropdown');
+  const msgIdx = parseInt(menu?.dataset?.msgIdx || '0', 10);
+  await forkFromMessage(msgIdx);
+}
+
+// ============================================
+// Office — 2D Pixel Art Agent Visualization
+// ============================================
+
+function stopOfficeAutoRefresh() {
+  if (state._officeInterval) {
+    clearInterval(state._officeInterval);
+    state._officeInterval = null;
+  }
+}
+
+async function loadOffice(container) {
+  container.innerHTML = `
+    <div class="page-header">
+      <div>
+        <div class="page-title" data-i18n="auto.office">Office</div>
+        <div class="page-subtitle" data-i18n="auto.agentWorkspaceVisualization">Agent workspace visualization</div>
+      </div>
+      <div style="display:flex;gap:8px;" id="office-controls">
+        <button class="btn btn-ghost btn-sm" onclick="window.openOfficeAssignPanel()" data-i18n="auto.departments">Departments</button>
+        <button class="btn btn-ghost btn-sm" onclick="window.refreshOffice()" data-i18n="home.refresh">↻ Refresh</button>
+      </div>
+    </div>
+    <div class="office-viewport" id="office-viewport">
+      <div class="office-floor" id="office-floor">
+        <div class="loading" data-i18n="auto.loadingOffice">Loading office</div>
+      </div>
+    </div>
+    <div class="office-assign-panel" id="office-assign-panel"></div>
+  `;
+
+  await refreshOffice();
+
+  stopOfficeAutoRefresh();
+  state._officeInterval = setInterval(refreshOffice, 10000);
+}
+
+async function refreshOffice() {
+  const floor = document.getElementById('office-floor');
+  if (!floor) return;
+
+  try {
+    const [profilesRes, deptsRes] = await Promise.all([
+      api('/api/profiles'),
+      api('/api/office/departments'),
+    ]);
+    const profiles = profilesRes.ok ? (profilesRes.profiles || []) : [];
+    const departments = deptsRes.ok ? (deptsRes.departments || []) : [];
+    renderOfficeFloor(profiles, departments, floor);
+  } catch (e) {
+    if (floor) floor.innerHTML = `<div class="empty">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderOfficeFloor(profiles, departments, floorEl) {
+  if (!profiles.length) {
+    floorEl.innerHTML = '<div class="empty" style="padding:40px;" data-i18n="auto.noAgentsFoundCreateAgentsFirst">No agents found. Create agents first.</div>';
+    return;
+  }
+
+  const profileMap = Object.fromEntries(profiles.map(p => [p.name, p]));
+
+  const assignmentMap = {};
+  departments.forEach(dept => {
+    dept.members.forEach(m => { assignmentMap[m] = dept; });
+  });
+
+  const unassigned = profiles.filter(p => !assignmentMap[p.name]);
+
+  const DESKS_PER_ROW = 3;
+  const DESK_SLOT_W = 88;
+  const DESK_SLOT_H = 88;
+  const ZONE_PADDING = 20;
+  const ZONE_LABEL_H = 20;
+  const ZONE_GAP = 20;
+  const FLOOR_PADDING = 24;
+
+  function zoneWidth(count) {
+    return Math.min(count, DESKS_PER_ROW) * DESK_SLOT_W + ZONE_PADDING * 2;
+  }
+  function zoneHeight(count) {
+    return Math.ceil(count / DESKS_PER_ROW) * DESK_SLOT_H + ZONE_PADDING * 2 + ZONE_LABEL_H;
+  }
+
+  const zones = [
+    ...departments
+      .map(d => ({
+        id: d.id,
+        name: d.name,
+        color: d.color,
+        agents: d.members.map(m => profileMap[m]).filter(Boolean),
+      }))
+      .filter(z => z.agents.length > 0),
+    ...(unassigned.length > 0 ? [{
+      id: '__unassigned__',
+      name: 'Unassigned',
+      color: '#6f9ac3',
+      agents: unassigned,
+    }] : []),
+  ];
+
+  if (!zones.length) {
+    floorEl.innerHTML = '<div class="empty" style="padding:40px;" data-i18n="auto.noAgentsToDisplay">No agents to display.</div>';
+    return;
+  }
+
+  let zonesHtml = '';
+  let currentY = FLOOR_PADDING;
+  let maxWidth = 0;
+
+  zones.forEach(zone => {
+    const count = zone.agents.length;
+    const w = zoneWidth(count);
+    const h = zoneHeight(count);
+    if (w + FLOOR_PADDING * 2 > maxWidth) maxWidth = w + FLOOR_PADDING * 2;
+
+    let agentsHtml = '';
+    zone.agents.forEach(profile => {
+      if (!profile) return;
+      const running = profile.gateway === 'running';
+      const stateClass = running ? 'office-agent--running' : 'office-agent--idle';
+      const deskClass  = running ? 'office-desk--running'  : 'office-desk--idle';
+      agentsHtml += `
+        <div class="office-desk-slot">
+          <div class="office-desk ${deskClass}">
+            <div class="office-agent ${stateClass}"
+                 data-profile="${escapeHtml(profile.name)}"
+                 data-running="${running}"
+                 onclick="window.showOfficeAgentPopup(this, event)">
+              <div class="agent-head">
+                <div class="agent-status-dot"></div>
+              </div>
+              <div class="agent-torso"></div>
+              <div class="agent-legs">
+                <div class="agent-leg"></div>
+                <div class="agent-leg"></div>
+              </div>
+              <div class="agent-name">${escapeHtml(profile.name)}</div>
+            </div>
+          </div>
+        </div>
+      `;
+    });
+
+    const borderColor = zone.color;
+    zonesHtml += `
+      <div class="office-dept-zone" style="
+        position: absolute;
+        left: ${FLOOR_PADDING}px;
+        top: ${currentY}px;
+        width: ${w}px;
+        height: ${h}px;
+        border-color: ${escapeHtml(borderColor)};
+      ">
+        <div class="office-dept-label" style="color:${escapeHtml(borderColor)};border-color:${escapeHtml(borderColor)};">
+          ${escapeHtml(zone.name)}
+        </div>
+        <div class="office-agents-grid">
+          ${agentsHtml}
+        </div>
+      </div>
+    `;
+    currentY += h + ZONE_GAP;
+  });
+
+  const totalHeight = Math.max(400, currentY + FLOOR_PADDING);
+  floorEl.style.minHeight = totalHeight + 'px';
+  floorEl.style.minWidth  = Math.max(480, maxWidth + FLOOR_PADDING) + 'px';
+  floorEl.innerHTML = zonesHtml;
+}
+
+function showOfficeAgentPopup(agentEl, event) {
+  event.stopPropagation();
+
+  const existing = document.getElementById('office-agent-popup');
+  if (existing) {
+    const isSame = existing.dataset.profile === agentEl.dataset.profile;
+    existing.remove();
+    if (isSame) return;
+  }
+
+  const profileName = agentEl.dataset.profile;
+  const running = agentEl.dataset.running === 'true';
+
+  const popup = document.createElement('div');
+  popup.className = 'office-agent-popup';
+  popup.id = 'office-agent-popup';
+  popup.dataset.profile = profileName;
+  popup.innerHTML = `
+    <div class="popup-name">${escapeHtml(profileName)}</div>
+    <div class="popup-row">
+      <span data-i18n="auto.status">Status</span>
+      <span class="popup-val ${running ? 'status-ok' : 'status-off'}">${running ? '● Running' : '○ Stopped'}</span>
+    </div>
+    <div class="popup-actions">
+      <button class="btn btn-primary btn-sm"
+              onclick="navigate('agent-detail',{name:'${escapeHtml(profileName)}'});document.getElementById('office-agent-popup')?.remove();">
+        Open
+      </button>
+      <button class="btn btn-ghost btn-sm"
+              onclick="document.getElementById('office-agent-popup')?.remove();">
+        Close
+      </button>
+    </div>
+  `;
+
+  const rect = agentEl.getBoundingClientRect();
+  const left = Math.min(rect.left, window.innerWidth - 260);
+  const top  = Math.min(rect.bottom + 6, window.innerHeight - 160);
+  popup.style.left = left + 'px';
+  popup.style.top  = top + 'px';
+
+  document.body.appendChild(popup);
+
+  setTimeout(() => {
+    document.addEventListener('click', () => {
+      document.getElementById('office-agent-popup')?.remove();
+    }, { once: true });
+  }, 0);
+}
+
+async function openOfficeAssignPanel() {
+  const panel = document.getElementById('office-assign-panel');
+  if (!panel) return;
+
+  if (panel.classList.contains('open')) {
+    panel.classList.remove('open');
+    return;
+  }
+
+  panel.innerHTML = '<div class="loading" data-i18n="common.loading">Loading</div>';
+  panel.classList.add('open');
+
+  try {
+    const [profilesRes, deptsRes] = await Promise.all([
+      api('/api/profiles'),
+      api('/api/office/departments'),
+    ]);
+    const profiles    = profilesRes.ok ? (profilesRes.profiles    || []) : [];
+    const departments = deptsRes.ok   ? (deptsRes.departments || []) : [];
+
+    panel.innerHTML = `
+      <div class="office-panel-header">
+        <div class="section-title" style="margin:0;" data-i18n="auto.departments">Departments</div>
+        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('office-assign-panel').classList.remove('open')">✕</button>
+      </div>
+      <button class="btn btn-primary btn-sm" style="width:100%;margin-bottom:10px;"
+              onclick="window.showCreateDeptForm()" data-i18n="auto.newDepartment">+ New Department</button>
+      <div id="dept-create-form" style="display:none;margin-bottom:12px;padding:10px;border:1px solid var(--border);border-radius:var(--radius);">
+        <input id="dept-name-input" class="input" placeholder="Department name" style="width:100%;margin-bottom:8px;box-sizing:border-box;" maxlength="40" />
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+          <label style="font-size:11px;color:var(--fg-muted);flex-shrink:0;" data-i18n="auto.color">Color</label>
+          <input id="dept-color-input" type="color" value="#7c945c" style="cursor:pointer;" />
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="window.submitCreateDept()" style="width:100%;" data-i18n="auto.create">Create</button>
+      </div>
+      <div id="dept-list">
+        ${departments.length === 0
+          ? '<div class="empty" style="padding:16px;" data-i18n="auto.noDepartmentsYet">No departments yet</div>'
+          : departments.map(d => renderDeptPanel(d, profiles)).join('')}
+      </div>
+    `;
+  } catch (e) {
+    panel.innerHTML = `<div class="empty">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderDeptPanel(dept, profiles) {
+  const memberSet = new Set(dept.members);
+  const memberRows = profiles.map(p => `
+    <label class="office-member-row">
+      <input type="checkbox" ${memberSet.has(p.name) ? 'checked' : ''}
+             onchange="window.toggleDeptMember('${escapeHtml(dept.id)}','${escapeHtml(p.name)}',this.checked)"
+             style="accent-color:${escapeHtml(dept.color)};" />
+      <span>${escapeHtml(p.name)}</span>
+      <span class="${p.gateway === 'running' ? 'status-ok' : 'status-off'}" style="font-size:10px;margin-left:auto;">
+        ${p.gateway === 'running' ? '●' : '○'}
+      </span>
+    </label>
+  `).join('');
+
+  return `
+    <div class="card" style="margin-bottom:8px;padding:10px 12px;border-left:3px solid ${escapeHtml(dept.color)};">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <span style="font-size:12px;font-weight:700;color:${escapeHtml(dept.color)};">${escapeHtml(dept.name)}</span>
+        <button class="btn btn-ghost btn-sm" style="color:var(--red);padding:2px 6px;"
+                onclick="window.deleteDept('${escapeHtml(dept.id)}')">×</button>
+      </div>
+      <div>${memberRows || '<div style="font-size:11px;color:var(--fg-muted);" data-i18n="auto.noAgentsAvailable">No agents available</div>'}</div>
+    </div>
+  `;
+}
+
+function showCreateDeptForm() {
+  const form = document.getElementById('dept-create-form');
+  if (form) form.style.display = form.style.display === 'none' ? 'block' : 'none';
+}
+
+async function submitCreateDept() {
+  const name  = document.getElementById('dept-name-input')?.value?.trim();
+  const color = document.getElementById('dept-color-input')?.value || '#7c945c';
+  if (!name) { showToast(t('toast.deptNameRequired'), 'error'); return; }
+  try {
+    const res = await api('/api/office/departments', {
+      method: 'POST',
+      body: JSON.stringify({ name, color }),
+    });
+    if (res.ok) {
+      showToast(t('toast.deptCreated'), 'success');
+      openOfficeAssignPanel();
+      refreshOffice();
+    } else {
+      showToast(res.error || 'Failed to create department', 'error');
+    }
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function deleteDept(id) {
+  if (!await customConfirm(t('dialog.confirmDeleteDept'), 'Delete')) return;
+  try {
+    const res = await api(`/api/office/departments/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (res.ok) {
+      showToast(t('toast.deptDeleted'), 'success');
+      openOfficeAssignPanel();
+      refreshOffice();
+    } else { showToast(res.error || 'Failed', 'error'); }
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+async function toggleDeptMember(deptId, profileName, add) {
+  try {
+    const res = await api('/api/office/departments');
+    if (!res.ok) return;
+    const dept = res.departments.find(d => d.id === deptId);
+    if (!dept) return;
+    let members = [...(dept.members || [])];
+    if (add) members = [...new Set([...members, profileName])];
+    else     members = members.filter(m => m !== profileName);
+    await api(`/api/office/departments/${encodeURIComponent(deptId)}/members`, {
+      method: 'PUT',
+      body: JSON.stringify({ members }),
+    });
+    refreshOffice();
+  } catch (e) { showToast(e.message, 'error'); }
+}
+
+// Expose office functions for inline onclick handlers
+window.openOfficeAssignPanel = openOfficeAssignPanel;
+window.showOfficeAgentPopup  = showOfficeAgentPopup;
+window.refreshOffice         = refreshOffice;
+window.showCreateDeptForm    = showCreateDeptForm;
+window.submitCreateDept      = submitCreateDept;
+window.deleteDept            = deleteDept;
+window.toggleDeptMember      = toggleDeptMember;
+
+
+// === Auto-translate on DOM changes (i18n applyTranslations debounced) ===
+(function() {
+  let _i18nApplyTimer = null;
+  const _scheduleApply = () => {
+    if (_i18nApplyTimer) return;
+    _i18nApplyTimer = setTimeout(() => {
+      try { i18nApply(); } catch (e) {}
+      _i18nApplyTimer = null;
+    }, 50);
+  };
+  if (typeof MutationObserver !== 'undefined') {
+    const obs = new MutationObserver(_scheduleApply);
+    document.addEventListener('DOMContentLoaded', () => {
+      obs.observe(document.body, { childList: true, subtree: true });
+    });
+  }
+})();
+
+initI18n().then(() => { init(); setTimeout(() => i18nApply(), 100); });

@@ -1,0 +1,430 @@
+/* ============================================================
+   Office Page — 2D Pixel Art Agent Visualization
+   ============================================================ */
+
+/* ── Page Layout ─────────────────────────────────────────── */
+
+.office-viewport {
+  width: 100%;
+  height: calc(100vh - 148px);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  position: relative;
+  background: var(--bg-card);
+}
+
+.office-floor {
+  position: relative;
+  min-width: 480px;
+  min-height: 400px;
+  padding: 24px;
+  /* Checkerboard tile background — no DOM nodes */
+  background-image: repeating-conic-gradient(
+    rgba(220, 203, 181, 0.04) 0% 25%,
+    rgba(220, 203, 181, 0.015) 0% 50%
+  );
+  background-size: 32px 32px;
+  /* Top wall */
+  border-top: 6px solid var(--border-strong, var(--border));
+  /* Left wall */
+  border-left: 6px solid var(--border-strong, var(--border));
+}
+
+/* ── Department Zone ─────────────────────────────────────── */
+
+.office-dept-zone {
+  position: absolute;
+  border: 2px solid;
+  border-radius: var(--radius);
+  background: rgba(0, 0, 0, 0.10);
+  padding: 8px;
+  box-sizing: border-box;
+}
+
+.office-dept-label {
+  position: absolute;
+  top: -11px;
+  left: 8px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid;
+  background: var(--bg-card);
+  white-space: nowrap;
+  font-family: var(--font);
+}
+
+.office-agents-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 18px;
+}
+
+/* ── Desk (CSS box-art) ──────────────────────────────────── */
+
+.office-desk-slot {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  width: 80px;
+  height: 80px;
+}
+
+.office-desk {
+  width: 64px;
+  height: 52px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* Monitor screen */
+.office-desk::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 12px;
+  width: 40px;
+  height: 24px;
+  border-radius: 2px;
+  border: 1px solid;
+  background: color-mix(in srgb, var(--bg-base) 80%, var(--blue) 20%);
+  border-color: color-mix(in srgb, var(--blue) 50%, transparent);
+  box-shadow: 0 0 5px rgba(111, 154, 195, 0.2);
+  transition: box-shadow 0.3s ease, border-color 0.3s ease, background 0.3s ease;
+}
+
+/* Desk surface */
+.office-desk::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 4px;
+  width: 56px;
+  height: 18px;
+  border-radius: 3px 3px 2px 2px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 8%, var(--bg-card));
+  transition: background 0.3s ease;
+}
+
+/* Running desk: green monitor glow */
+.office-desk--running::before {
+  background: color-mix(in srgb, var(--bg-base) 50%, var(--green) 50%);
+  border-color: var(--green);
+  box-shadow:
+    0 0 8px rgba(124, 148, 92, 0.5),
+    0 0 2px rgba(124, 148, 92, 0.8) inset;
+}
+
+/* Idle desk: faint blue monitor */
+.office-desk--idle::before {
+  box-shadow: 0 0 3px rgba(111, 154, 195, 0.12);
+  border-color: color-mix(in srgb, var(--blue) 30%, transparent);
+}
+
+/* ── Agent Sprite ────────────────────────────────────────── */
+
+.office-agent {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+  user-select: none;
+  position: relative;
+  padding: 0 4px 2px;
+}
+
+.office-agent:hover {
+  transform: translateY(-3px);
+  z-index: 20;
+}
+
+/* Head */
+.agent-head {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  border: 1px solid;
+  position: relative;
+  flex-shrink: 0;
+  transition: background 0.3s ease, box-shadow 0.3s ease, border-color 0.3s ease;
+}
+
+/* Torso */
+.agent-torso {
+  width: 14px;
+  height: 10px;
+  border-radius: 1px;
+  border: 1px solid;
+  position: relative;
+  flex-shrink: 0;
+  transition: background 0.3s ease, border-color 0.3s ease;
+}
+
+/* Arms (typing targets) */
+.agent-torso::before,
+.agent-torso::after {
+  content: '';
+  position: absolute;
+  width: 4px;
+  height: 6px;
+  top: 1px;
+  border-radius: 1px;
+  transition: background 0.3s ease;
+}
+.agent-torso::before { left: -5px; }
+.agent-torso::after  { right: -5px; }
+
+/* Legs */
+.agent-legs {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.agent-leg {
+  width: 5px;
+  height: 8px;
+  border-radius: 1px;
+  border: 1px solid;
+  transition: background 0.3s ease, border-color 0.3s ease;
+}
+
+/* Name tag */
+.agent-name {
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--fg-muted, var(--fg));
+  white-space: nowrap;
+  max-width: 60px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font);
+  opacity: 0.75;
+  margin-top: 1px;
+}
+
+/* ── Idle State ───────────────────────────────────────────── */
+
+.office-agent--idle .agent-head {
+  background: color-mix(in srgb, var(--fg) 20%, var(--bg-card));
+  border-color: var(--border);
+}
+
+.office-agent--idle .agent-torso {
+  background: color-mix(in srgb, var(--fg) 12%, var(--bg-card));
+  border-color: var(--border);
+}
+
+.office-agent--idle .agent-torso::before,
+.office-agent--idle .agent-torso::after {
+  background: color-mix(in srgb, var(--fg) 8%, var(--bg-card));
+}
+
+.office-agent--idle .agent-leg {
+  background: color-mix(in srgb, var(--fg) 15%, var(--bg-card));
+  border-color: var(--border);
+}
+
+/* ── Running State ───────────────────────────────────────── */
+
+.office-agent--running .agent-head {
+  background: var(--accent, var(--green));
+  border-color: var(--green);
+  box-shadow: 0 0 6px rgba(124, 148, 92, 0.5);
+}
+
+.office-agent--running .agent-torso {
+  background: color-mix(in srgb, var(--accent, var(--green)) 35%, var(--bg-card));
+  border-color: var(--green);
+}
+
+.office-agent--running .agent-torso::before,
+.office-agent--running .agent-torso::after {
+  background: var(--accent, var(--green));
+  animation: agent-type 0.35s steps(2, end) infinite alternate;
+}
+
+.office-agent--running .agent-leg {
+  background: color-mix(in srgb, var(--accent, var(--green)) 25%, var(--bg-card));
+  border-color: color-mix(in srgb, var(--green) 60%, transparent);
+}
+
+/* Typing arm bounce */
+@keyframes agent-type {
+  0%   { transform: translateY(0); }
+  100% { transform: translateY(-2px); }
+}
+
+/* ── Status Dot ──────────────────────────────────────────── */
+
+.agent-status-dot {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  border: 1px solid var(--bg-card);
+}
+
+.office-agent--running .agent-status-dot {
+  background: var(--green);
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+
+.office-agent--idle .agent-status-dot {
+  background: color-mix(in srgb, var(--fg) 30%, transparent);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(124, 148, 92, 0.5); }
+  50%       { box-shadow: 0 0 0 4px rgba(124, 148, 92, 0); }
+}
+
+/* ── Agent Info Popup ────────────────────────────────────── */
+
+.office-agent-popup {
+  position: fixed;
+  z-index: 600;
+  background: var(--bg-base, var(--bg));
+  border: 1px solid var(--border-strong, var(--border));
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  min-width: 180px;
+  max-width: 240px;
+  box-shadow: var(--shadow, 0 8px 32px rgba(0,0,0,0.4));
+  animation: slideUp 0.12s ease;
+  pointer-events: auto;
+  font-family: var(--font);
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.popup-name {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.popup-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-muted, var(--fg));
+}
+
+.popup-row:last-of-type { border-bottom: none; }
+
+.popup-val {
+  font-weight: 600;
+  font-size: 11px;
+}
+
+.popup-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+/* ── Department Assignment Panel ─────────────────────────── */
+
+.office-assign-panel {
+  position: fixed;
+  top: 56px;
+  right: 0;
+  bottom: 0;
+  width: 300px;
+  background: var(--bg-base, var(--bg));
+  border-left: 1px solid var(--border-strong, var(--border));
+  padding: 16px;
+  overflow-y: auto;
+  z-index: 400;
+  transform: translateX(100%);
+  transition: transform 0.25s ease;
+  box-sizing: border-box;
+}
+
+.office-assign-panel.open {
+  transform: translateX(0);
+}
+
+.office-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.office-member-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  padding: 4px 0;
+  cursor: pointer;
+  color: var(--fg);
+  border-radius: 3px;
+}
+
+.office-member-row:hover {
+  color: var(--fg);
+  opacity: 0.9;
+}
+
+.office-member-row input[type="checkbox"] {
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+/* ── Light Theme Adjustments ─────────────────────────────── */
+
+[data-theme="light"] .office-floor {
+  background-image: repeating-conic-gradient(
+    rgba(0, 0, 0, 0.03) 0% 25%,
+    rgba(0, 0, 0, 0.015) 0% 50%
+  );
+}
+
+[data-theme="light"] .office-dept-zone {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+/* ── Responsive ──────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  .office-viewport {
+    height: calc(100vh - 180px);
+  }
+
+  .office-assign-panel {
+    width: 100%;
+    top: 56px;
+  }
+}
