@@ -3,7 +3,7 @@
 A self-hosted web dashboard for the [Hermes AI agent](https://github.com/NousResearch/hermes-agent) stack. Manage agents, chat, terminals, files, cron, token analytics, MCP servers, and swarm pipelines — behind a password gate.
 
 **Stack:** Vanilla JS + Vite · Node.js · Express · WebSocket · xterm.js · Chart.js · better-sqlite3  
-**Version:** 3.6.0 · **License:** MIT
+**Version:** 3.6.1 · **License:** MIT
 
 ---
 
@@ -26,7 +26,8 @@ See [docs/INSTALL.md](docs/INSTALL.md) for production setup, nginx, and systemd.
 | Page | What |
 |------|------|
 | **Home** | System health, agent overview, gateway status, token usage |
-| **Chat** | Real-time streaming via gateway API, tool call cards, multi-profile |
+| **Chat** | Real-time streaming, tool call cards, multi-profile |
+| **Workspace** | Browse, edit files and chat with Hermes scoped to a project directory |
 | **Agents** | Profile CRUD, gateway lifecycle, per-agent dashboard/sessions/cron |
 | **Office** | 3-panel swarm monitor — agent health, kanban pipeline, live feed |
 | **Monitor** | Gateway logs, CPU/RAM metrics, live process view |
@@ -160,7 +161,7 @@ Full config: [docs/CONFIG.md](docs/CONFIG.md)
 ## Updating
 
 ```bash
-git pull origin main
+git pull upstream main
 npm install
 npm run build
 # Restart your HCI service (adjust service name):
@@ -186,7 +187,7 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for zero-downtime deploys.
 ---
 
 Built for the [Hermes Agent](https://github.com/NousResearch/hermes-agent) ecosystem.  
-[@bayendor](https://x.com/bayendor) · [GitHub](https://github.com/xaspx/hermes-control-interface)
+Upstream [@bayendor](https://x.com/bayendor) · [GitHub](https://github.com/xaspx/hermes-control-interface)
 
 ---
 
@@ -201,9 +202,10 @@ HCI is a **self-hosted web dashboard** for the Hermes AI agent stack. Manage age
 **Q: What can I manage with HCI?**
 
 | Page | Capabilities |
-|---|---|
+|---|---|---|
 | **Home** | System health, agent overview, gateway status, token usage |
 | **Chat** | Real-time streaming, tool call cards, multi-profile |
+| **Workspace** | Browse, edit files and chat with Hermes scoped to a project directory |
 | **Agents** | Profile CRUD, gateway lifecycle, dashboard/sessions/cron |
 | **Office** | 3-panel swarm monitor — agent health, kanban, live feed |
 | **Monitor** | Gateway logs, CPU/RAM metrics, live process view |
@@ -256,7 +258,7 @@ npm install && npm run build
 node server.js            # → http://localhost:10274
 ```
 
-See [docs/INSTALL.md](docs/INSTALL.md) for production setup.
+See [docs/INSTALL.md](docs/INSTALL.md) for full setup.
 
 **Q: What are the requirements?**
 
@@ -267,7 +269,7 @@ See [docs/INSTALL.md](docs/INSTALL.md) for production setup.
 **Q: How do I update HCI?**
 
 ```bash
-git pull origin main
+git pull upstream main
 npm install
 npm run build
 # Restart your HCI service (adjust service name):
@@ -285,7 +287,7 @@ systemctl restart hci-staging
 | **Terminal** | xterm.js |
 | **Charts** | Chart.js |
 | **Database** | better-sqlite3 |
-| **Version** | 3.6.0 |
+| **Version** | 3.6.1 |
 
 ### Security
 
